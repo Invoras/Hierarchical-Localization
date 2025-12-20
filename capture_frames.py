@@ -1,25 +1,63 @@
 #!/usr/bin/env python3
 """
-Simple LiveKit frame capture script for drone mapping
-Connects to the drone-stream room and saves frames every 0.5 seconds
+Real-Time Drone Localization and Visualization
+
+Connects to a LiveKit drone stream and:
+1. Localizes the drone position on a sparse 3D map every 5 seconds
+2. Displays real-time 3D visualization in a browser at http://127.0.0.1:8050
+
+The visualization shows:
+- Full 3D sparse reconstruction (reference map)
+- Drone camera position and orientation (green frustum)
+- Position (X,Y,Z) and orientation (yaw/pitch/roll) information
+- Localization quality (inlier count)
+
+Uses pre-loaded ML models (NetVLAD, SuperPoint, LightGlue) for fast localization.
 """
 
 import asyncio
 import logging
 import os
 import sys
+import threading
+import copy
 from datetime import datetime
 from pathlib import Path
 import requests
 import cv2
 import numpy as np
 from livekit import rtc
+import torch
+import h5py
+import pycolmap
+from scipy.spatial.transform import Rotation
+from dash import Dash, dcc, html, Input, Output
+import plotly.graph_objects as go
+
+from hloc import extract_features, match_features, pairs_from_retrieval
+from hloc.localize_sfm import QueryLocalizer, pose_from_cluster
+from hloc.utils.io import read_image
+from hloc.utils import viz_3d
+from hloc.extractors.netvlad import NetVLAD
+from hloc.extractors.superpoint import SuperPoint
+from hloc.matchers.lightglue import LightGlue
 
 # Configuration
 ROOM_NAME = "drone-stream"
 TOKEN_SERVER_URL = "https://n189ebyfq6.execute-api.eu-central-1.amazonaws.com/default/token"
 FRAME_INTERVAL = 0.1  # seconds
 WARMUP_DELAY = 10  # seconds - wait for SFU bandwidth estimation to ramp up to full quality
+
+# Localization configuration
+LOCALIZE_INTERVAL = 5.0  # seconds - localize drone position every 5 seconds
+DASH_PORT = 8050
+DASH_HOST = "127.0.0.1"
+DASH_REFRESH_INTERVAL = 2000  # milliseconds - browser refresh rate (increased to reduce load)
+
+# Default paths for localization
+SPARSE_MODEL_PATH = "final_inputs/v1/sparse/0"
+REFERENCE_FEATURES_PATH = "outputs/sfm_1s/feats-superpoint-n4096-r1024.h5"
+REFERENCE_IMAGES_PATH = "final_inputs/v1/images"
 
 # Logging setup
 logging.basicConfig(
@@ -29,15 +67,347 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def extract_netvlad_direct(model, image_path, retrieval_conf, device):
+    """Extract NetVLAD global descriptor using pre-loaded model."""
+
+    # Load and preprocess image (NetVLAD uses RGB, not grayscale)
+    image = read_image(image_path, grayscale=False)
+    original_size = np.array(image.shape[:2])
+
+    # Resize if needed
+    if "resize_max" in retrieval_conf["preprocessing"]:
+        h, w = image.shape[:2]
+        max_size = retrieval_conf["preprocessing"]["resize_max"]
+        scale = max_size / max(h, w)
+        if scale < 1:
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Convert to tensor (RGB, so 3 channels)
+    if len(image.shape) == 2:
+        image = np.stack([image] * 3, axis=-1)
+    image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)[None].to(device) / 255.0
+
+    # Extract global descriptor
+    with torch.no_grad():
+        pred = model({"image": image_tensor})
+
+    # Convert to numpy
+    pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+    pred["image_size"] = original_size
+
+    return pred
+
+
+def extract_superpoint_direct(model, image_path, feature_conf, device):
+    """Extract SuperPoint features using pre-loaded model (bypasses extract_features.main())."""
+
+    # Load and preprocess image
+    image = read_image(image_path, grayscale=feature_conf["preprocessing"]["grayscale"])
+    original_size = np.array(image.shape[:2])
+
+    # Resize if needed
+    if "resize_max" in feature_conf["preprocessing"]:
+        h, w = image.shape[:2]
+        max_size = feature_conf["preprocessing"]["resize_max"]
+        scale = max_size / max(h, w)
+        if scale < 1:
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Convert to tensor
+    image_tensor = torch.from_numpy(image).float()[None, None].to(device) / 255.0
+
+    # Extract features
+    with torch.no_grad():
+        pred = model({"image": image_tensor})
+
+    # Convert to numpy
+    pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+
+    # Scale keypoints back to original resolution
+    if "keypoints" in pred:
+        size = np.array(image_tensor.shape[-2:][::-1])
+        scales = (original_size[::-1] / size).astype(np.float32)
+        pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
+        if "scales" in pred:
+            pred["scales"] *= scales.mean()
+
+    pred["image_size"] = original_size
+
+    return pred
+
+
+def match_features_direct(model, features0, features1, device):
+    """Match features using pre-loaded model (bypasses match_features.main())."""
+
+    # Prepare data for matching (LightGlue expects image tensors even though it only uses their size)
+    data = {
+        "keypoints0": torch.from_numpy(features0["keypoints"]).float()[None].to(device),
+        "keypoints1": torch.from_numpy(features1["keypoints"]).float()[None].to(device),
+        "descriptors0": torch.from_numpy(features0["descriptors"]).float()[None].to(device),
+        "descriptors1": torch.from_numpy(features1["descriptors"]).float()[None].to(device),
+        "image0": torch.empty((1, 1) + tuple(features0["image_size"][::-1])).to(device),
+        "image1": torch.empty((1, 1) + tuple(features1["image_size"][::-1])).to(device),
+    }
+
+    # Match
+    with torch.no_grad():
+        pred = model(data)
+
+    # Convert to numpy
+    matches = pred["matches0"][0].cpu().numpy()
+    scores = pred["matching_scores0"][0].cpu().numpy()
+
+    return matches, scores
+
+
+class LocalizationState:
+    """Thread-safe shared state for localization results"""
+
+    def __init__(self, sparse_model):
+        self._lock = threading.Lock()
+        self._latest_pose = None  # Camera pose (Rigid3d)
+        self._latest_camera = None  # Camera params
+        self._latest_inliers = None  # Inlier count
+        self._latest_total_matches = None  # Total matches
+        self._latest_timestamp = None  # When localized
+        self._latest_frame_num = None  # Frame number
+        self._error_message = None  # Error if localization failed
+        self.sparse_model = sparse_model  # Reference reconstruction (immutable)
+
+    def update_pose(self, pose_data):
+        """Update with new localization result"""
+        with self._lock:
+            self._latest_pose = pose_data['cam_from_world']
+            self._latest_camera = pose_data['camera']
+            self._latest_inliers = pose_data['inliers']
+            self._latest_total_matches = pose_data['total_matches']
+            self._latest_frame_num = pose_data['frame_num']
+            self._latest_timestamp = pose_data['timestamp']
+            self._error_message = None  # Clear error on success
+
+    def set_error(self, error_msg):
+        """Set error message (keeps last good pose)"""
+        with self._lock:
+            self._error_message = error_msg
+
+    def get_latest(self):
+        """Get latest localization data (thread-safe copy)"""
+        with self._lock:
+            if self._latest_pose is None:
+                return None
+            return {
+                'cam_from_world': self._latest_pose,
+                'camera': self._latest_camera,
+                'inliers': self._latest_inliers,
+                'total_matches': self._latest_total_matches,
+                'frame_num': self._latest_frame_num,
+                'timestamp': self._latest_timestamp,
+                'error': self._error_message
+            }
+
+
+def create_dash_app(localization_state):
+    """Create Dash app for real-time 3D visualization"""
+    app = Dash(__name__)
+
+    # Pre-render the sparse reconstruction ONCE (cached)
+    logger.info("Pre-rendering sparse reconstruction for visualization...")
+    base_fig = viz_3d.init_figure()
+    viz_3d.plot_reconstruction(
+        base_fig,
+        localization_state.sparse_model,
+        color='rgba(255,0,0,0.0)',
+        points_rgb=True,
+        cameras=False,
+        min_track_length=3,
+        name="Reference Map"
+    )
+    # Preserve camera view across updates
+    base_fig.update_layout(uirevision='constant')
+    logger.info("Sparse reconstruction pre-rendered!")
+
+    app.layout = html.Div([
+        html.H1("Real-Time Drone Localization", style={'textAlign': 'center'}),
+
+        # Status display
+        html.Div(id='status-text', style={'padding': '20px', 'fontSize': '14px'}),
+
+        # 3D visualization
+        dcc.Graph(
+            id='3d-plot',
+            style={'height': '80vh'}
+        ),
+
+        # Auto-refresh interval (every 1 second)
+        dcc.Interval(
+            id='interval-component',
+            interval=DASH_REFRESH_INTERVAL,  # milliseconds
+            n_intervals=0
+        )
+    ])
+
+    @app.callback(
+        [Output('3d-plot', 'figure'),
+         Output('status-text', 'children')],
+        Input('interval-component', 'n_intervals')
+    )
+    def update_visualization(n):
+        """Update 3D visualization with latest localization data"""
+        # Get latest localization data from shared state
+        latest = localization_state.get_latest()
+        logger.info(f"Dash callback: latest={latest is not None}")
+
+        if latest is None:
+            # No localization yet - show base figure with waiting message
+            logger.info("  No localization data yet")
+            return base_fig, html.Div("Waiting for first localization...", style={'color': 'gray', 'fontSize': '16px'})
+
+        try:
+            logger.info(f"  Rendering visualization for frame {latest['frame_num']}")
+
+            # Clone the pre-rendered base figure (sparse reconstruction)
+            fig = go.Figure(base_fig)
+
+            # Add drone camera frustum (green) to the existing figure
+            logger.info("  Adding camera frustum...")
+            viz_3d.plot_camera_colmap(
+                fig,
+                latest['cam_from_world'],
+                latest['camera'],
+                color="rgba(0,255,0,0.6)",
+                name="Drone Camera",
+                fill=True,
+                text=f"Frame: {latest['frame_num']}\nInliers: {latest['inliers']}"
+            )
+
+            # 3. Build status text
+            logger.info("  Building status text...")
+            c2w = latest['cam_from_world'].inverse()
+            pos = c2w.translation
+            rot = Rotation.from_matrix(c2w.rotation.matrix())
+            yaw, pitch, roll = rot.as_euler('zyx', degrees=True)
+
+            status_children = [
+                html.H3("Drone Position (meters)"),
+                html.P(f"X: {pos[0]:.3f} | Y: {pos[1]:.3f} | Z: {pos[2]:.3f}"),
+                html.H3("Orientation (degrees)"),
+                html.P(f"Yaw: {yaw:.1f}° | Pitch: {pitch:.1f}° | Roll: {roll:.1f}°"),
+                html.H3("Localization Info"),
+                html.P(f"Frame: {latest['frame_num']} | Inliers: {latest['inliers']}/{latest['total_matches']} | Time: {latest['timestamp'].strftime('%H:%M:%S')}")
+            ]
+
+            # Add error message if present
+            if latest['error']:
+                status_children.append(
+                    html.Div(
+                        f"⚠ Warning: {latest['error']}",
+                        style={'color': 'red', 'fontWeight': 'bold', 'marginTop': '10px'}
+                    )
+                )
+
+            logger.info("  Visualization rendered successfully")
+            return fig, html.Div(status_children)
+        except Exception as e:
+            logger.error(f"  Error rendering visualization: {e}")
+            import traceback
+            traceback.print_exc()
+            empty_fig = viz_3d.init_figure()
+            error_msg = html.Div([
+                html.H3("Error rendering visualization", style={'color': 'red'}),
+                html.P(str(e))
+            ])
+            return empty_fig, error_msg
+
+    return app
+
+
+def run_dash_server(app):
+    """Run Dash server in background thread"""
+    try:
+        app.run(debug=False, host=DASH_HOST, port=DASH_PORT, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Dash server error: {e}")
+
+
 class FrameCapture:
-    def __init__(self, output_folder: str):
+    def __init__(self, output_folder: str, sparse_model_path: str, reference_features_path: str, reference_images_path: str):
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(parents=True, exist_ok=True)
         self.frame_count = 0
-        self.last_save_time = 0
+        self.last_localize_time = 0
+        self.localizing = False
         self.running = True
 
         logger.info(f"Output folder: {self.output_folder}")
+
+        # Store paths
+        self.sparse_model_path = Path(sparse_model_path)
+        self.reference_features_path = Path(reference_features_path)
+        self.reference_images_path = Path(reference_images_path)
+
+        # Load sparse model
+        logger.info("Loading sparse reconstruction model...")
+        self.sparse_model = pycolmap.Reconstruction(self.sparse_model_path)
+        self.ref_image_list = sorted([img.name for img in self.sparse_model.images.values()])
+        logger.info(f"  Loaded model: {len(self.sparse_model.images)} images, {len(self.sparse_model.points3D)} 3D points")
+
+        # Device setup
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"  Using device: {self.device}")
+
+        # Feature extraction configs
+        self.retrieval_conf = extract_features.confs["netvlad"]
+        self.feature_conf = extract_features.confs["superpoint_aachen"]
+        self.matcher_conf = match_features.confs["superpoint+lightglue"]
+
+        # Load ML models
+        logger.info("  Loading NetVLAD, SuperPoint, and LightGlue models...")
+        self.netvlad_model = NetVLAD(self.retrieval_conf['model']).eval().to(self.device)
+        self.superpoint_model = SuperPoint(self.feature_conf['model']).eval().to(self.device)
+        self.lightglue_model = LightGlue(self.matcher_conf['model']).eval().to(self.device)
+        logger.info("  Models loaded successfully!")
+
+        # Extract NetVLAD features for reference images (if needed)
+        # Use a permanent cache location (not in timestamped output folder)
+        cache_dir = Path("outputs/localization_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self.global_features_ref = cache_dir / "global-feats-netvlad.h5"
+
+        if not self.global_features_ref.exists():
+            logger.info("  Extracting NetVLAD features for reference images (one-time setup)...")
+            extract_features.main(
+                self.retrieval_conf,
+                self.reference_images_path,
+                image_list=self.ref_image_list,
+                feature_path=self.global_features_ref,
+                overwrite=False
+            )
+            logger.info("  NetVLAD cache built successfully!")
+        else:
+            logger.info("  Using cached NetVLAD features for reference images")
+
+        # Create localizer
+        self.loc_config = {
+            "estimation": {"ransac": {"max_error": 12}},
+            "refinement": {"refine_focal_length": True, "refine_extra_params": True}
+        }
+        self.localizer = QueryLocalizer(self.sparse_model, self.loc_config)
+
+        # Initialize shared state for visualization
+        self.localization_state = LocalizationState(self.sparse_model)
+
+        # Start Dash server in background thread
+        logger.info("  Starting Dash visualization server...")
+        dash_app = create_dash_app(self.localization_state)
+        dash_thread = threading.Thread(
+            target=run_dash_server,
+            args=(dash_app,),
+            daemon=True
+        )
+        dash_thread.start()
+        logger.info(f"📊 Visualization available at http://{DASH_HOST}:{DASH_PORT}")
 
     async def connect_to_room(self):
         """Fetch token and connect to LiveKit room"""
@@ -159,18 +529,22 @@ class FrameCapture:
                         logger.info(f"✅ SUCCESS: Receiving full 1080p resolution!")
 
                     logger.info(f"")
-                    logger.info(f"📹 Starting frame capture every {FRAME_INTERVAL}s...")
+                    logger.info(f"📍 Localizing drone position every {LOCALIZE_INTERVAL}s...")
                     warmup_complete = True
-                    self.last_save_time = asyncio.get_event_loop().time()
+                    self.last_localize_time = asyncio.get_event_loop().time()
                 continue
 
-            # Normal frame capture after warm-up
+            # Localization after warm-up
             current_time = asyncio.get_event_loop().time()
 
-            # Save frame every FRAME_INTERVAL seconds
-            if current_time - self.last_save_time >= FRAME_INTERVAL:
-                await self.save_frame(frame_event.frame)
-                self.last_save_time = current_time
+            # Localize every LOCALIZE_INTERVAL (5 seconds)
+            if current_time - self.last_localize_time >= LOCALIZE_INTERVAL:
+                if not self.localizing:  # Prevent overlap
+                    self.localizing = True
+                    asyncio.create_task(self.localize_frame(frame_event.frame))
+                    self.last_localize_time = current_time
+                else:
+                    logger.warning("Skipping localization - previous still running")
 
     async def save_frame(self, frame: rtc.VideoFrame):
         """Convert and save video frame as image"""
@@ -200,13 +574,163 @@ class FrameCapture:
         except Exception as e:
             logger.error(f"Failed to save frame: {e}")
 
+    def frame_to_numpy(self, frame: rtc.VideoFrame) -> np.ndarray:
+        """Convert LiveKit frame to RGB numpy array for localization"""
+        buffer = frame.convert(rtc.VideoBufferType.RGBA)
+        data = np.frombuffer(buffer.data, dtype=np.uint8)
+        img = data.reshape((buffer.height, buffer.width, 4))
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)  # RGB for NetVLAD
+        return img_rgb
+
+    async def localize_frame(self, frame: rtc.VideoFrame):
+        """Localize current frame using pre-loaded models"""
+        try:
+            # Increment frame count
+            self.frame_count += 1
+
+            # Convert frame to numpy
+            img_array = self.frame_to_numpy(frame)
+
+            # Save as temp image for processing
+            query_name = f"query_frame_{self.frame_count}.jpg"
+            query_path = self.output_folder / query_name
+            cv2.imwrite(str(query_path), cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
+
+            # 1. Extract NetVLAD features
+            netvlad_features = extract_netvlad_direct(
+                self.netvlad_model, query_path, self.retrieval_conf, self.device
+            )
+
+            # Save to H5 for retrieval
+            global_features_query = self.output_folder / "global-feats-query.h5"
+            with h5py.File(str(global_features_query), "w") as fd:
+                grp = fd.create_group(query_name)
+                for k, v in netvlad_features.items():
+                    grp.create_dataset(k, data=v)
+
+            # 2. Image retrieval (top 10)
+            retrieval_pairs = self.output_folder / "pairs-retrieval.txt"
+            pairs_from_retrieval.main(
+                global_features_query,
+                retrieval_pairs,
+                num_matched=10,
+                db_descriptors=self.global_features_ref,
+                db_model=self.sparse_model_path,
+                query_prefix=None,
+                query_list=[query_name]
+            )
+
+            # Get retrieved reference names
+            retrieved_refs = []
+            with open(retrieval_pairs, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        retrieved_refs.append(parts[1])
+
+            # 3. Extract SuperPoint features
+            query_features = extract_superpoint_direct(
+                self.superpoint_model, query_path, self.feature_conf, self.device
+            )
+
+            # 4. Match with LightGlue
+            matches_path = self.output_folder / "matches.h5"
+            all_matches = {}
+
+            with h5py.File(str(self.reference_features_path), "r") as ref_fd:
+                for ref_name in retrieved_refs:
+                    if ref_name not in ref_fd:
+                        continue
+
+                    ref_group = ref_fd[ref_name]
+                    ref_features = {
+                        "keypoints": ref_group["keypoints"][:],
+                        "descriptors": ref_group["descriptors"][:],
+                        "image_size": ref_group["image_size"][:],
+                    }
+
+                    matches, scores = match_features_direct(
+                        self.lightglue_model,
+                        query_features,
+                        ref_features,
+                        self.device
+                    )
+
+                    pair_key = f"{query_name}/{ref_name}"
+                    all_matches[pair_key] = {
+                        "matches0": matches,
+                        "matching_scores0": scores,
+                    }
+
+            # Save matches
+            with h5py.File(str(matches_path), "w") as fd:
+                for pair_key, match_data in all_matches.items():
+                    grp = fd.create_group(pair_key)
+                    grp.create_dataset("matches0", data=match_data["matches0"])
+                    grp.create_dataset("matching_scores0", data=match_data["matching_scores0"])
+
+            # Save features
+            local_features = self.output_folder / "feats-query.h5"
+            with h5py.File(str(local_features), "w") as fd:
+                with h5py.File(str(self.reference_features_path), "r") as ref_fd:
+                    for ref_name in retrieved_refs:
+                        if ref_name in ref_fd:
+                            ref_fd.copy(ref_name, fd)
+
+                q_grp = fd.create_group(query_name)
+                for k, v in query_features.items():
+                    q_grp.create_dataset(k, data=v)
+
+            # 5. PnP+RANSAC localization
+            ref_ids = [self.sparse_model.find_image_with_name(name).image_id
+                       for name in retrieved_refs]
+            camera = pycolmap.infer_camera_from_image(query_path)
+
+            ret, log = pose_from_cluster(
+                self.localizer,
+                query_name,
+                camera,
+                ref_ids,
+                local_features,
+                matches_path
+            )
+
+            if ret is not None:
+                # Success - update shared state
+                self.localization_state.update_pose({
+                    'cam_from_world': ret['cam_from_world'],
+                    'camera': ret['camera'],
+                    'inliers': ret['num_inliers'],
+                    'total_matches': len(ret['inlier_mask']),
+                    'frame_num': self.frame_count,
+                    'timestamp': datetime.now()
+                })
+                logger.info(f"✓ Localized frame {self.frame_count}: "
+                           f"{ret['num_inliers']} inliers")
+                logger.info(f"  State updated - checking: {self.localization_state.get_latest() is not None}")
+            else:
+                # Failed
+                self.localization_state.set_error(
+                    f"Failed to localize frame {self.frame_count}"
+                )
+                logger.warning(f"✗ Localization failed for frame {self.frame_count}")
+
+            # Cleanup temp file
+            query_path.unlink(missing_ok=True)
+
+        except Exception as e:
+            logger.error(f"Localization error: {e}")
+            self.localization_state.set_error(str(e))
+        finally:
+            self.localizing = False
+
     async def run(self):
         """Main run loop"""
         room = None
         try:
             room = await self.connect_to_room()
 
-            logger.info(f"📹 Capturing frames every {FRAME_INTERVAL}s. Press Ctrl+C to stop.")
+            logger.info(f"📍 Localizing drone every {LOCALIZE_INTERVAL}s. Press Ctrl+C to stop.")
 
             # Keep running until interrupted
             while self.running:
@@ -221,21 +745,25 @@ class FrameCapture:
         finally:
             if room:
                 await room.disconnect()
-            logger.info(f"✅ Capture complete! Saved {self.frame_count} frames to {self.output_folder}")
+            logger.info(f"✅ Localization complete! Output in {self.output_folder}")
 
 
 async def main():
     """Entry point"""
-    # Create output folder with timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_folder = f"captured_frames_{timestamp}"
+    # Use a single temp folder (not timestamped) for localization temp files
+    output_folder = "outputs/localization_temp"
 
     logger.info("=" * 60)
-    logger.info("🚁 Drone Frame Capture")
+    logger.info("🚁 Drone Frame Capture + Real-Time Localization")
     logger.info("=" * 60)
 
-    # Create and run capture
-    capture = FrameCapture(output_folder)
+    # Create and run capture with localization
+    capture = FrameCapture(
+        output_folder,
+        sparse_model_path=SPARSE_MODEL_PATH,
+        reference_features_path=REFERENCE_FEATURES_PATH,
+        reference_images_path=REFERENCE_IMAGES_PATH
+    )
     await capture.run()
 
 
