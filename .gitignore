@@ -8,3 +8,6 @@ outputs/
 datasets/*
 !datasets/sacre_coeur/
 datasets/sacre_coeur/query
+images*
+final_inputs/*
+test_images/*

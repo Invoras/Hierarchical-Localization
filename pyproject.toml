@@ -1,0 +1,24 @@
+[project]
+name = "hierarchical-localization"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gdown>=5.2.0",
+    "h5py>=3.15.1",
+    "kornia>=0.6.11",
+    "lightglue",
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "opencv-python>=4.11.0.86",
+    "plotly>=6.5.0",
+    "pycolmap>=3.13.0",
+    "scipy>=1.15.3",
+    "torch>=1.1",
+    "torchvision>=0.3",
+    "tqdm>=4.36.0",
+]
+
+[tool.uv.sources]
+lightglue = { git = "https://github.com/cvg/LightGlue" }
