@@ -54,6 +54,11 @@ DASH_PORT = 8050
 DASH_HOST = "127.0.0.1"
 DASH_REFRESH_INTERVAL = 2000  # milliseconds - browser refresh rate (increased to reduce load)
 
+# Third-person camera configuration
+CAMERA_OFFSET_BACK = 1.5    # Meters behind the drone
+CAMERA_OFFSET_UP = 0.0      # Meters above the drone
+CAMERA_LOOK_AHEAD = 0.0     # Look directly at drone (0.0 = no offset)
+
 # Default paths for localization
 SPARSE_MODEL_PATH = "final_inputs/v1/sparse/0"
 REFERENCE_FEATURES_PATH = "outputs/sfm_1s/feats-superpoint-n4096-r1024.h5"
@@ -208,6 +213,83 @@ class LocalizationState:
             }
 
 
+def calculate_third_person_camera(
+    drone_world_pos: np.ndarray,
+    drone_rotation_matrix: np.ndarray,
+    sparse_model: pycolmap.Reconstruction,
+    offset_back: float = 3.0,
+    offset_up: float = 1.5,
+    look_ahead: float = 0.0
+) -> dict:
+    """
+    Calculate third-person camera position for Plotly visualization.
+
+    Args:
+        drone_world_pos: [x, y, z] drone position in world coordinates
+        drone_rotation_matrix: 3x3 rotation from camera to world (c2w)
+        sparse_model: Reconstruction to get data bounds
+        offset_back: Meters behind the drone (default: 3.0)
+        offset_up: Meters above the drone (default: 1.5)
+        look_ahead: Meters ahead of drone to look at (default: 0.0)
+
+    Returns:
+        Dictionary with 'eye', 'center', 'up' for Plotly scene_camera
+    """
+    # Extract orientation vectors from rotation matrix
+    # Columns represent camera axes in world frame
+    right_world = drone_rotation_matrix[:, 0]
+    down_world = drone_rotation_matrix[:, 1]   # Y-down convention
+    forward_world = drone_rotation_matrix[:, 2]  # Camera +Z direction
+
+    # Calculate camera position: behind and above the drone
+    camera_pos_world = (
+        drone_world_pos
+        - forward_world * offset_back   # Move opposite to forward
+        - down_world * offset_up         # Move opposite to down (i.e., up)
+    )
+
+    # Camera looks at drone position (or slightly ahead)
+    look_at_world = drone_world_pos + forward_world * look_ahead
+
+    # Get data bounds for coordinate transformation
+    # Calculate bounds directly from 3D points (more compatible across pycolmap versions)
+    all_points = np.array([p3D.xyz for p3D in sparse_model.points3D.values()])
+
+    # Use percentiles to filter outliers (similar to compute_bounding_box)
+    data_min = np.percentile(all_points, 0.1, axis=0)
+    data_max = np.percentile(all_points, 99.9, axis=0)
+    data_center = (data_min + data_max) / 2.0
+    data_extent = data_max - data_min
+
+    # Convert to Plotly domain coordinates
+    max_extent = np.max(data_extent)
+    scale_factor = 2.0 / max_extent
+
+    camera_domain = (camera_pos_world - data_center) * scale_factor
+    target_domain = (look_at_world - data_center) * scale_factor
+
+    # Up vector: opposite of down direction
+    up_world = -down_world
+
+    return {
+        'eye': {
+            'x': float(camera_domain[0]),
+            'y': float(camera_domain[1]),
+            'z': float(camera_domain[2])
+        },
+        'center': {
+            'x': float(target_domain[0]),
+            'y': float(target_domain[1]),
+            'z': float(target_domain[2])
+        },
+        'up': {
+            'x': float(up_world[0]),
+            'y': float(up_world[1]),
+            'z': float(up_world[2])
+        }
+    }
+
+
 def create_dash_app(localization_state):
     """Create Dash app for real-time 3D visualization"""
     app = Dash(__name__)
@@ -234,6 +316,21 @@ def create_dash_app(localization_state):
         # Status display
         html.Div(id='status-text', style={'padding': '20px', 'fontSize': '14px'}),
 
+        # Camera mode toggle
+        html.Div([
+            html.Label("Camera Mode:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+            dcc.RadioItems(
+                id='camera-mode-toggle',
+                options=[
+                    {'label': ' Auto-Follow Drone', 'value': 'auto'},
+                    {'label': ' Free Camera (Manual Control)', 'value': 'manual'}
+                ],
+                value='auto',  # Default to auto-follow
+                labelStyle={'display': 'inline-block', 'marginRight': '20px'},
+                style={'display': 'inline-block'}
+            )
+        ], style={'padding': '10px 20px', 'backgroundColor': '#f0f0f0', 'marginBottom': '10px'}),
+
         # 3D visualization
         dcc.Graph(
             id='3d-plot',
@@ -251,9 +348,10 @@ def create_dash_app(localization_state):
     @app.callback(
         [Output('3d-plot', 'figure'),
          Output('status-text', 'children')],
-        Input('interval-component', 'n_intervals')
+        [Input('interval-component', 'n_intervals'),
+         Input('camera-mode-toggle', 'value')]
     )
-    def update_visualization(n):
+    def update_visualization(n, camera_mode):
         """Update 3D visualization with latest localization data"""
         # Get latest localization data from shared state
         latest = localization_state.get_latest()
@@ -282,11 +380,36 @@ def create_dash_app(localization_state):
                 text=f"Frame: {latest['frame_num']}\nInliers: {latest['inliers']}"
             )
 
+            # Get drone position and orientation (used for camera and status text)
+            c2w = latest['cam_from_world'].inverse()
+            drone_pos = c2w.translation
+            drone_rot = c2w.rotation.matrix()
+
+            # Calculate and apply third-person camera if in auto-follow mode
+            if camera_mode == 'auto':
+                logger.info("  Calculating third-person camera position...")
+                camera_config = calculate_third_person_camera(
+                    drone_pos,
+                    drone_rot,
+                    localization_state.sparse_model,
+                    offset_back=CAMERA_OFFSET_BACK,
+                    offset_up=CAMERA_OFFSET_UP,
+                    look_ahead=CAMERA_LOOK_AHEAD
+                )
+
+                # Apply camera update with changing uirevision to force camera update
+                fig.update_layout(
+                    scene_camera=camera_config,
+                    uirevision=n  # Change uirevision to force camera update
+                )
+            else:
+                # Manual mode: preserve user camera control
+                fig.update_layout(uirevision='constant')
+
             # 3. Build status text
             logger.info("  Building status text...")
-            c2w = latest['cam_from_world'].inverse()
-            pos = c2w.translation
-            rot = Rotation.from_matrix(c2w.rotation.matrix())
+            pos = drone_pos
+            rot = Rotation.from_matrix(drone_rot)
             yaw, pitch, roll = rot.as_euler('zyx', degrees=True)
 
             status_children = [
