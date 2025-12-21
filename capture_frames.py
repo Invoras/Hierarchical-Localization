@@ -355,22 +355,22 @@ def create_dash_app(localization_state):
         """Update 3D visualization with latest localization data"""
         # Get latest localization data from shared state
         latest = localization_state.get_latest()
-        logger.info(f"Dash callback: latest={latest is not None}")
+        logger.debug(f"Dash callback: latest={latest is not None}")
 
         if latest is None:
             # No localization yet - show base figure with waiting message
-            logger.info("  No localization data yet")
+            logger.debug("  No localization data yet")
             return base_fig, html.Div("Waiting for first localization...", style={'color': 'gray', 'fontSize': '16px'})
 
         try:
-            logger.info(f"  Rendering visualization for frame {latest['frame_num']}")
+            logger.debug(f"  Rendering visualization for frame {latest['frame_num']}")
 
             # Clone the pre-rendered base figure (sparse reconstruction)
             # Use deepcopy to properly preserve 3D trace types (Scatter3d)
             fig = copy.deepcopy(base_fig)
 
             # Add drone camera frustum (green) to the existing figure
-            logger.info("  Adding camera frustum...")
+            logger.debug("  Adding camera frustum...")
             viz_3d.plot_camera_colmap(
                 fig,
                 latest['cam_from_world'],
@@ -389,7 +389,7 @@ def create_dash_app(localization_state):
 
             # Calculate and apply third-person camera if in auto-follow mode
             if camera_mode == 'auto':
-                logger.info("  Calculating third-person camera position...")
+                logger.debug("  Calculating third-person camera position...")
                 camera_config = calculate_third_person_camera(
                     drone_pos,
                     drone_rot,
@@ -412,7 +412,7 @@ def create_dash_app(localization_state):
                 fig.update_layout(uirevision='constant')
 
             # 3. Build status text
-            logger.info("  Building status text...")
+            logger.debug("  Building status text...")
             pos = drone_pos
             rot = Rotation.from_matrix(drone_rot)
             yaw, pitch, roll = rot.as_euler('zyx', degrees=True)
@@ -435,7 +435,7 @@ def create_dash_app(localization_state):
                     )
                 )
 
-            logger.info("  Visualization rendered successfully")
+            logger.debug("  Visualization rendered successfully")
             return fig, html.Div(status_children)
         except Exception as e:
             logger.error(f"  Error rendering visualization: {e}")
@@ -453,6 +453,11 @@ def create_dash_app(localization_state):
 
 def run_dash_server(app):
     """Run Dash server in background thread"""
+    # Silence Flask/Werkzeug HTTP request logs
+    import logging as werkzeug_logging
+    werkzeug_log = werkzeug_logging.getLogger('werkzeug')
+    werkzeug_log.setLevel(werkzeug_logging.WARNING)
+
     try:
         app.run(debug=False, host=DASH_HOST, port=DASH_PORT, use_reloader=False)
     except Exception as e:
