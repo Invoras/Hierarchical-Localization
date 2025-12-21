@@ -55,7 +55,7 @@ DASH_HOST = "127.0.0.1"
 DASH_REFRESH_INTERVAL = 2000  # milliseconds - browser refresh rate (increased to reduce load)
 
 # Third-person camera configuration
-CAMERA_OFFSET_BACK = 1.5    # Meters behind the drone
+CAMERA_OFFSET_BACK = 3.5    # Meters behind the drone
 CAMERA_OFFSET_UP = 0.0      # Meters above the drone
 CAMERA_LOOK_AHEAD = 0.0     # Look directly at drone (0.0 = no offset)
 
@@ -378,6 +378,7 @@ def create_dash_app(localization_state):
                 color="rgba(0,255,0,0.6)",
                 name="Drone Camera",
                 fill=True,
+                size=0.5,  # Smaller frustum to reduce clipping when camera is close
                 text=f"Frame: {latest['frame_num']}\nInliers: {latest['inliers']}"
             )
 
@@ -399,6 +400,9 @@ def create_dash_app(localization_state):
                 )
 
                 # Apply camera update with changing uirevision to force camera update
+                # Use perspective projection for better close-up rendering
+                camera_config['projection'] = {'type': 'perspective'}
+
                 fig.update_layout(
                     scene_camera=camera_config,
                     uirevision=n  # Change uirevision to force camera update
