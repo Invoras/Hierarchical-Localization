@@ -366,7 +366,8 @@ def create_dash_app(localization_state):
             logger.info(f"  Rendering visualization for frame {latest['frame_num']}")
 
             # Clone the pre-rendered base figure (sparse reconstruction)
-            fig = go.Figure(base_fig)
+            # Use deepcopy to properly preserve 3D trace types (Scatter3d)
+            fig = copy.deepcopy(base_fig)
 
             # Add drone camera frustum (green) to the existing figure
             logger.info("  Adding camera frustum...")
