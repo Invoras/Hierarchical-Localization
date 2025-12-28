@@ -21,6 +21,7 @@ import os
 import sys
 import threading
 import copy
+import json
 from datetime import datetime
 from pathlib import Path
 import requests
@@ -49,7 +50,7 @@ FRAME_INTERVAL = 0.1  # seconds
 WARMUP_DELAY = 10  # seconds - wait for SFU bandwidth estimation to ramp up to full quality
 
 # Localization configuration
-LOCALIZE_INTERVAL = 5.0  # seconds - localize drone position every 5 seconds
+LOCALIZE_INTERVAL = 20.0  # seconds - localize drone position every 20 seconds (changed from 5.0 for telemetry-based dead reckoning)
 DASH_PORT = 8050
 DASH_HOST = "127.0.0.1"
 DASH_REFRESH_INTERVAL = 2000  # milliseconds - browser refresh rate (increased to reduce load)
@@ -167,30 +168,193 @@ def match_features_direct(model, features0, features1, device):
     return matches, scores
 
 
-class LocalizationState:
-    """Thread-safe shared state for localization results"""
+class HybridLocalizationState:
+    """Thread-safe state for hybrid HLOC + telemetry localization
+
+    Combines HLOC fixes (every 20s) with telemetry-based dead reckoning for
+    continuous position updates.
+
+    Coordinate System: HLOC world frame with Y-up convention
+    - Y-axis: Vertical (altitude is position[1])
+    - Horizontal plane: X-Z
+    - Yaw: Rotation around Y-axis
+    """
 
     def __init__(self, sparse_model):
         self._lock = threading.Lock()
-        self._latest_pose = None  # Camera pose (Rigid3d)
-        self._latest_camera = None  # Camera params
-        self._latest_inliers = None  # Inlier count
-        self._latest_total_matches = None  # Total matches
-        self._latest_timestamp = None  # When localized
-        self._latest_frame_num = None  # Frame number
-        self._error_message = None  # Error if localization failed
-        self.sparse_model = sparse_model  # Reference reconstruction (immutable)
 
-    def update_pose(self, pose_data):
-        """Update with new localization result"""
+        # HLOC state (ground truth, updated every 20s)
+        self._latest_hloc_pose = None  # pycolmap.Rigid3d (cam_from_world)
+        self._latest_hloc_camera = None  # Camera parameters
+        self._latest_hloc_inliers = None  # Inlier count
+        self._latest_hloc_matches = None  # Total matches
+        self._latest_hloc_timestamp = None  # datetime when HLOC ran
+        self._latest_hloc_frame = None  # Frame number
+        self._hloc_initialized = False  # Flag for first HLOC success
+
+        # Telemetry state (continuous updates)
+        self._latest_telemetry = None  # Full telemetry dict
+        self._last_telemetry_timestamp_ns = None  # For staleness detection
+        self._last_telemetry_time = None  # For dt calculation
+
+        # Dead reckoning state (updated continuously from telemetry)
+        self._dr_position = None  # [x, y, z] in HLOC world frame (y is altitude!)
+        self._dr_rotation_matrix = None  # 3x3 rotation matrix in HLOC frame
+
+        # Calibration parameters (computed after first HLOC)
+        self._heading_offset_deg = None  # NED→HLOC yaw offset
+        self._altitude_offset_m = None  # Telemetry altitude to HLOC Y offset
+        self._calibrated = False
+
+        # Status tracking
+        self._pose_source = "waiting"  # "hloc", "telemetry", "waiting"
+        self._error_message = None
+
+        # Reference data
+        self.sparse_model = sparse_model
+
+    def update_hloc_pose(self, pose_data):
+        """Update with new HLOC localization result"""
         with self._lock:
-            self._latest_pose = pose_data['cam_from_world']
-            self._latest_camera = pose_data['camera']
-            self._latest_inliers = pose_data['inliers']
-            self._latest_total_matches = pose_data['total_matches']
-            self._latest_frame_num = pose_data['frame_num']
-            self._latest_timestamp = pose_data['timestamp']
-            self._error_message = None  # Clear error on success
+            # Store HLOC data
+            self._latest_hloc_pose = pose_data['cam_from_world']
+            self._latest_hloc_camera = pose_data['camera']
+            self._latest_hloc_inliers = pose_data['inliers']
+            self._latest_hloc_matches = pose_data['total_matches']
+            self._latest_hloc_frame = pose_data['frame_num']
+            self._latest_hloc_timestamp = pose_data['timestamp']
+            self._error_message = None
+
+            # Extract position and orientation
+            c2w = self._latest_hloc_pose.inverse()
+            position = c2w.translation  # np.array [x, y, z]
+            rotation = c2w.rotation.matrix()  # 3x3 numpy array
+
+            # Reset dead reckoning to HLOC position (corrects drift)
+            self._dr_position = np.array(position)
+            self._dr_rotation_matrix = np.array(rotation)
+
+            # Calibrate on first HLOC
+            if not self._hloc_initialized:
+                self._hloc_initialized = True
+                logging.info("First HLOC fix received - system initialized")
+                if self._latest_telemetry is not None:
+                    self._calibrate()
+            elif self._calibrated and self._latest_telemetry is not None:
+                # Recalibrate on every HLOC to handle drift in offsets
+                self._calibrate()
+
+            self._pose_source = "hloc"
+            logging.info(f"HLOC fix: position=[{position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}], inliers={self._latest_hloc_inliers}")
+
+    def update_telemetry(self, telemetry_dict):
+        """Process incoming telemetry data"""
+        with self._lock:
+            # Check for stale data (same timestamp_ns)
+            current_timestamp_ns = telemetry_dict.get('timestamp_ns')
+            if current_timestamp_ns == self._last_telemetry_timestamp_ns:
+                return  # Skip stale data
+
+            # Store previous telemetry for dt calculation
+            prev_telemetry = self._latest_telemetry
+            prev_time = self._last_telemetry_time
+
+            # Update telemetry state
+            self._latest_telemetry = telemetry_dict
+            self._last_telemetry_timestamp_ns = current_timestamp_ns
+            self._last_telemetry_time = datetime.now()
+
+            # Calibrate if HLOC initialized but not yet calibrated
+            if self._hloc_initialized and not self._calibrated:
+                self._calibrate()
+
+            # Perform dead reckoning if calibrated
+            if self._calibrated and prev_telemetry is not None and prev_time is not None:
+                self._update_dead_reckoning(prev_telemetry, telemetry_dict, prev_time)
+                self._pose_source = "telemetry"
+
+    def _calibrate(self):
+        """Compute heading and altitude offsets (NED → HLOC transformation)"""
+        if self._latest_telemetry is None or self._dr_rotation_matrix is None:
+            logging.warning("Cannot calibrate: missing telemetry or HLOC data")
+            return
+
+        # Extract HLOC heading (yaw) from rotation matrix
+        # Y-axis is up, yaw is rotation around Y in X-Z plane
+        # Camera forward is typically +Z axis, so extract yaw from Z-column
+        R = self._dr_rotation_matrix
+        hloc_yaw_rad = np.arctan2(R[0, 2], R[2, 2])  # Yaw of forward (+Z) direction
+        hloc_yaw_deg = np.degrees(hloc_yaw_rad)
+
+        # Extract telemetry heading
+        telem_heading_deg = self._latest_telemetry.get('heading_deg', 0.0)
+
+        # Compute heading offset (handle wrap-around)
+        heading_offset = hloc_yaw_deg - telem_heading_deg
+        # Normalize to [-180, 180]
+        self._heading_offset_deg = ((heading_offset + 180.0) % 360.0) - 180.0
+
+        # Extract altitude offset (Y is altitude in HLOC)
+        # Negate position_z_m because NED Z-down (positive=down) vs HLOC Y-up (positive=up)
+        telem_altitude = -self._latest_telemetry.get('position_z_m', 0.0)
+        hloc_y = self._dr_position[1]  # Y is altitude
+        self._altitude_offset_m = hloc_y - telem_altitude
+
+        self._calibrated = True
+
+        logging.info(f"Calibration complete:")
+        logging.info(f"  Heading offset: {self._heading_offset_deg:.2f}°")
+        logging.info(f"  Altitude offset: {self._altitude_offset_m:.2f}m")
+        logging.info(f"  HLOC yaw: {hloc_yaw_deg:.2f}°, Telem heading: {telem_heading_deg:.2f}°")
+
+    def _update_dead_reckoning(self, prev_telem, curr_telem, prev_time):
+        """Integrate velocities to update dead reckoning position"""
+
+        # Calculate time delta
+        current_time = datetime.now()
+        dt = (current_time - prev_time).total_seconds()
+
+        # Sanity check: skip if dt is too large (missing data) or too small (duplicate)
+        if dt <= 0.0 or dt > 1.0:
+            logging.warning(f"Abnormal dt={dt:.3f}s, skipping dead reckoning update")
+            return
+
+        # Extract NED velocities (m/s)
+        v_ned = np.array([
+            curr_telem.get('velocity_x_ms', 0.0),  # North
+            curr_telem.get('velocity_y_ms', 0.0),  # East
+            curr_telem.get('velocity_z_ms', 0.0),  # Down
+        ])
+
+        # Transform velocities: NED → HLOC world frame
+        # HLOC: Y-up, horizontal plane is X-Z
+        # If forward is +Z in HLOC, then: North→Z, East→X (or vice versa)
+        theta = np.radians(self._heading_offset_deg)
+        v_hloc_z = v_ned[0] * np.cos(theta) - v_ned[1] * np.sin(theta)  # North→Z
+        v_hloc_x = v_ned[0] * np.sin(theta) + v_ned[1] * np.cos(theta)  # East→X
+        v_hloc_y = -v_ned[2]  # Vertical (NED Z-down → HLOC Y-up)
+
+        # Integrate horizontal position (X, Z from velocities)
+        self._dr_position[0] += v_hloc_x * dt
+        self._dr_position[2] += v_hloc_z * dt
+
+        # Use altitude directly for Y (more accurate than integrating velocity_y)
+        # Negate position_z_m because NED Z-down (positive=down) vs HLOC Y-up (positive=up)
+        telem_altitude = -curr_telem.get('position_z_m', 0.0)
+        self._dr_position[1] = telem_altitude + self._altitude_offset_m  # Y is altitude
+
+        # Update orientation (yaw only, assume level flight)
+        telem_heading = curr_telem.get('heading_deg', 0.0)
+        hloc_yaw = np.radians(telem_heading + self._heading_offset_deg)
+
+        # Construct rotation matrix (Y-up convention, yaw rotation around Y)
+        cos_yaw = np.cos(hloc_yaw)
+        sin_yaw = np.sin(hloc_yaw)
+        self._dr_rotation_matrix = np.array([
+            [ cos_yaw, 0.0, sin_yaw],
+            [ 0.0,     1.0, 0.0    ],
+            [-sin_yaw, 0.0, cos_yaw]
+        ])
 
     def set_error(self, error_msg):
         """Set error message (keeps last good pose)"""
@@ -198,18 +362,27 @@ class LocalizationState:
             self._error_message = error_msg
 
     def get_latest(self):
-        """Get latest localization data (thread-safe copy)"""
+        """Get latest position estimate for visualization"""
         with self._lock:
-            if self._latest_pose is None:
+            if self._pose_source == "waiting":
                 return None
+
+            # Return current position/rotation from dead reckoning
+            if self._dr_position is None:
+                return None
+
             return {
-                'cam_from_world': self._latest_pose,
-                'camera': self._latest_camera,
-                'inliers': self._latest_inliers,
-                'total_matches': self._latest_total_matches,
-                'frame_num': self._latest_frame_num,
-                'timestamp': self._latest_timestamp,
-                'error': self._error_message
+                'position': self._dr_position.copy(),
+                'rotation': self._dr_rotation_matrix.copy(),
+                'cam_from_world': self._latest_hloc_pose,  # Keep for camera params
+                'camera': self._latest_hloc_camera,
+                'inliers': self._latest_hloc_inliers,
+                'total_matches': self._latest_hloc_matches,
+                'frame_num': self._latest_hloc_frame,
+                'timestamp': self._latest_hloc_timestamp,
+                'error': self._error_message,
+                'source': self._pose_source,
+                'calibrated': self._calibrated,
             }
 
 
@@ -369,23 +542,32 @@ def create_dash_app(localization_state):
             # Use deepcopy to properly preserve 3D trace types (Scatter3d)
             fig = copy.deepcopy(base_fig)
 
-            # Add drone camera frustum (green) to the existing figure
-            logger.debug("  Adding camera frustum...")
+            # Get drone position and orientation from dead reckoning
+            drone_pos = latest['position']
+            drone_rot = latest['rotation']
+
+            # Construct cam_from_world for visualization from current position/rotation
+            # Create world_from_cam first, then invert
+            world_from_cam_rot = pycolmap.Rotation3d(drone_rot)
+            world_from_cam = pycolmap.Rigid3d(world_from_cam_rot, drone_pos)
+            cam_from_world_viz = world_from_cam.inverse()
+
+            # Choose color based on source: green for HLOC, orange for telemetry
+            source = latest['source']
+            frustum_color = "rgba(0,255,0,0.6)" if source == "hloc" else "rgba(255,165,0,0.6)"
+
+            # Add drone camera frustum to the existing figure
+            logger.debug(f"  Adding camera frustum ({source})...")
             viz_3d.plot_camera_colmap(
                 fig,
-                latest['cam_from_world'],
+                cam_from_world_viz,
                 latest['camera'],
-                color="rgba(0,255,0,0.6)",
-                name="Drone Camera",
+                color=frustum_color,
+                name=f"Drone ({source.upper()})",
                 fill=True,
                 size=0.5,  # Smaller frustum to reduce clipping when camera is close
-                text=f"Frame: {latest['frame_num']}\nInliers: {latest['inliers']}"
+                text=f"Frame: {latest['frame_num']}\nSource: {source.upper()}\nInliers: {latest['inliers']}"
             )
-
-            # Get drone position and orientation (used for camera and status text)
-            c2w = latest['cam_from_world'].inverse()
-            drone_pos = c2w.translation
-            drone_rot = c2w.rotation.matrix()
 
             # Calculate and apply third-person camera if in auto-follow mode
             if camera_mode == 'auto':
@@ -417,13 +599,27 @@ def create_dash_app(localization_state):
             rot = Rotation.from_matrix(drone_rot)
             yaw, pitch, roll = rot.as_euler('zyx', degrees=True)
 
+            # Get source and calibration info
+            source = latest['source']
+            calibrated = latest['calibrated']
+            source_color = 'green' if source == 'hloc' else 'orange'
+
             status_children = [
                 html.H3("Drone Position (meters)"),
                 html.P(f"X: {pos[0]:.3f} | Y: {pos[1]:.3f} | Z: {pos[2]:.3f}"),
                 html.H3("Orientation (degrees)"),
                 html.P(f"Yaw: {yaw:.1f}° | Pitch: {pitch:.1f}° | Roll: {roll:.1f}°"),
                 html.H3("Localization Info"),
-                html.P(f"Frame: {latest['frame_num']} | Inliers: {latest['inliers']}/{latest['total_matches']} | Time: {latest['timestamp'].strftime('%H:%M:%S')}")
+                html.P([
+                    f"Frame: {latest['frame_num']} | ",
+                    html.Span(
+                        f"Source: {source.upper()}",
+                        style={'fontWeight': 'bold', 'color': source_color}
+                    ),
+                    f" | HLOC Inliers: {latest['inliers']}/{latest['total_matches']} | ",
+                    f"Calibrated: {'✓' if calibrated else '✗'} | ",
+                    f"Time: {latest['timestamp'].strftime('%H:%M:%S')}"
+                ])
             ]
 
             # Add error message if present
@@ -528,8 +724,8 @@ class FrameCapture:
         }
         self.localizer = QueryLocalizer(self.sparse_model, self.loc_config)
 
-        # Initialize shared state for visualization
-        self.localization_state = LocalizationState(self.sparse_model)
+        # Initialize shared state for visualization (hybrid HLOC + telemetry)
+        self.localization_state = HybridLocalizationState(self.sparse_model)
 
         # Start Dash server in background thread
         logger.info("  Starting Dash visualization server...")
@@ -590,6 +786,17 @@ class FrameCapture:
             @room.on("participant_disconnected")
             def on_participant_disconnected(participant: rtc.RemoteParticipant):
                 logger.info(f"Participant disconnected: {participant.identity}")
+
+            @room.on("data_received")
+            def on_data_received(data: rtc.DataPacket):
+                """Receive and process telemetry data packets"""
+                try:
+                    telemetry = json.loads(data.data.decode('utf-8'))
+                    self.localization_state.update_telemetry(telemetry)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse telemetry JSON: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to process telemetry: {e}")
 
             # Connect with room options
             # Note: adaptive_stream is disabled by default in Python SDK when not using UI elements
@@ -829,8 +1036,8 @@ class FrameCapture:
             )
 
             if ret is not None:
-                # Success - update shared state
-                self.localization_state.update_pose({
+                # Success - update shared state with HLOC fix
+                self.localization_state.update_hloc_pose({
                     'cam_from_world': ret['cam_from_world'],
                     'camera': ret['camera'],
                     'inliers': ret['num_inliers'],
