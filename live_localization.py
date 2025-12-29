@@ -32,7 +32,7 @@ import torch
 import h5py
 import pycolmap
 from scipy.spatial.transform import Rotation
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, Patch, no_update
 import plotly.graph_objects as go
 
 from hloc import extract_features, match_features, pairs_from_retrieval
@@ -53,7 +53,7 @@ WARMUP_DELAY = 10  # seconds - wait for SFU bandwidth estimation to ramp up to f
 LOCALIZE_INTERVAL = 20.0  # seconds - localize drone position every 20 seconds (changed from 5.0 for telemetry-based dead reckoning)
 DASH_PORT = 8050
 DASH_HOST = "127.0.0.1"
-DASH_REFRESH_INTERVAL = 2000  # milliseconds - browser refresh rate (increased to reduce load)
+DASH_REFRESH_INTERVAL = 500  # milliseconds - browser refresh rate (increased to reduce load)
 
 # Third-person camera configuration
 CAMERA_OFFSET_BACK = 3.5    # Meters behind the drone
@@ -343,7 +343,7 @@ class HybridLocalizationState:
         telem_altitude = -curr_telem.get('position_z_m', 0.0)
         self._dr_position[1] = telem_altitude + self._altitude_offset_m  # Y is altitude
 
-        # Update orientation (yaw only, assume level flight)
+        # Update orientation (yaw only from telemetry heading)
         telem_heading = curr_telem.get('heading_deg', 0.0)
         hloc_yaw = np.radians(telem_heading + self._heading_offset_deg)
 
@@ -483,6 +483,35 @@ def create_dash_app(localization_state):
     base_fig.update_layout(uirevision='constant')
     logger.info("Sparse reconstruction pre-rendered!")
 
+    # Store number of base traces (for Patch-based updates)
+    num_base_traces = len(base_fig.data)
+    logger.info(f"Base figure has {num_base_traces} traces")
+
+    # Add placeholder drone traces that will be updated via Patch
+    # Trace 1: Camera frustum (lines forming pyramid shape)
+    # Frustum has 5 points: camera center + 4 corners of image plane
+    # We draw lines: center->corners and around the rectangle
+    base_fig.add_trace(go.Scatter3d(
+        x=[0]*16, y=[0]*16, z=[0]*16,
+        mode='lines',
+        line=dict(width=3, color='green'),
+        name='Drone Camera',
+        showlegend=True,
+        connectgaps=False  # None values create gaps between line segments
+    ))
+    # Trace 2: Frustum fill (mesh for the front face)
+    base_fig.add_trace(go.Mesh3d(
+        x=[0]*4, y=[0]*4, z=[0]*4,
+        i=[0, 0], j=[1, 2], k=[2, 3],
+        color='green',
+        opacity=0.3,
+        name='Frustum Fill',
+        showlegend=False
+    ))
+
+    # Track if first update (need full figure) or subsequent (use Patch)
+    first_update = [True]  # Use list for mutability in closure
+
     app.layout = html.Div([
         html.H1("Real-Time Drone Localization", style={'textAlign': 'center'}),
 
@@ -525,7 +554,7 @@ def create_dash_app(localization_state):
          Input('camera-mode-toggle', 'value')]
     )
     def update_visualization(n, camera_mode):
-        """Update 3D visualization with latest localization data"""
+        """Update 3D visualization with latest localization data using Patch for speed"""
         # Get latest localization data from shared state
         latest = localization_state.get_latest()
         logger.debug(f"Dash callback: latest={latest is not None}")
@@ -533,41 +562,75 @@ def create_dash_app(localization_state):
         if latest is None:
             # No localization yet - show base figure with waiting message
             logger.debug("  No localization data yet")
-            return base_fig, html.Div("Waiting for first localization...", style={'color': 'gray', 'fontSize': '16px'})
+            if first_update[0]:
+                return base_fig, html.Div("Waiting for first localization...", style={'color': 'gray', 'fontSize': '16px'})
+            else:
+                return no_update, html.Div("Waiting for first localization...", style={'color': 'gray', 'fontSize': '16px'})
 
         try:
             logger.debug(f"  Rendering visualization for frame {latest['frame_num']}")
-
-            # Clone the pre-rendered base figure (sparse reconstruction)
-            # Use deepcopy to properly preserve 3D trace types (Scatter3d)
-            fig = copy.deepcopy(base_fig)
 
             # Get drone position and orientation from dead reckoning
             drone_pos = latest['position']
             drone_rot = latest['rotation']
 
-            # Construct cam_from_world for visualization from current position/rotation
-            # Create world_from_cam first, then invert
-            world_from_cam_rot = pycolmap.Rotation3d(drone_rot)
-            world_from_cam = pycolmap.Rigid3d(world_from_cam_rot, drone_pos)
-            cam_from_world_viz = world_from_cam.inverse()
-
             # Choose color based on source: green for HLOC, orange for telemetry
             source = latest['source']
-            frustum_color = "rgba(0,255,0,0.6)" if source == "hloc" else "rgba(255,165,0,0.6)"
+            frustum_color = 'green' if source == 'hloc' else 'orange'
 
-            # Add drone camera frustum to the existing figure
-            logger.debug(f"  Adding camera frustum ({source})...")
-            viz_3d.plot_camera_colmap(
-                fig,
-                cam_from_world_viz,
-                latest['camera'],
-                color=frustum_color,
-                name=f"Drone ({source.upper()})",
-                fill=True,
-                size=0.5,  # Smaller frustum to reduce clipping when camera is close
-                text=f"Frame: {latest['frame_num']}\nSource: {source.upper()}\nInliers: {latest['inliers']}"
-            )
+            # Calculate camera frustum corners
+            # Camera axes from rotation matrix (columns)
+            right = drone_rot[:, 0]    # X-axis (right)
+            up = -drone_rot[:, 1]      # Y-axis (up, negated because camera Y is down)
+            forward = drone_rot[:, 2]  # Z-axis (forward)
+
+            # Frustum parameters (smaller for cleaner visualization)
+            frustum_depth = 0.25  # How far the frustum extends (meters)
+            aspect = 16/9         # Aspect ratio
+            fov_scale = 0.2       # Controls frustum width
+
+            # Calculate the 4 corners of the frustum front face
+            half_w = frustum_depth * fov_scale * aspect
+            half_h = frustum_depth * fov_scale
+            center_front = drone_pos + forward * frustum_depth
+
+            # Corners: top-left, top-right, bottom-right, bottom-left
+            c_tl = center_front + up * half_h - right * half_w
+            c_tr = center_front + up * half_h + right * half_w
+            c_br = center_front - up * half_h + right * half_w
+            c_bl = center_front - up * half_h - right * half_w
+
+            # Build frustum lines: center to each corner, then around the rectangle
+            # Format: [center->tl, None, center->tr, None, center->br, None, center->bl, None, tl->tr->br->bl->tl]
+            frustum_x = [drone_pos[0], c_tl[0], None, drone_pos[0], c_tr[0], None,
+                        drone_pos[0], c_br[0], None, drone_pos[0], c_bl[0], None,
+                        c_tl[0], c_tr[0], c_br[0], c_bl[0], c_tl[0]]
+            frustum_y = [drone_pos[1], c_tl[1], None, drone_pos[1], c_tr[1], None,
+                        drone_pos[1], c_br[1], None, drone_pos[1], c_bl[1], None,
+                        c_tl[1], c_tr[1], c_br[1], c_bl[1], c_tl[1]]
+            frustum_z = [drone_pos[2], c_tl[2], None, drone_pos[2], c_tr[2], None,
+                        drone_pos[2], c_br[2], None, drone_pos[2], c_bl[2], None,
+                        c_tl[2], c_tr[2], c_br[2], c_bl[2], c_tl[2]]
+
+            # Drone trace indices (after base traces)
+            frustum_trace_idx = num_base_traces      # Frustum lines
+            mesh_trace_idx = num_base_traces + 1     # Frustum fill mesh
+
+            # Use Patch for fast partial updates (no deepcopy!)
+            patched_fig = Patch()
+
+            # Update frustum lines
+            patched_fig['data'][frustum_trace_idx]['x'] = frustum_x
+            patched_fig['data'][frustum_trace_idx]['y'] = frustum_y
+            patched_fig['data'][frustum_trace_idx]['z'] = frustum_z
+            patched_fig['data'][frustum_trace_idx]['line']['color'] = frustum_color
+            patched_fig['data'][frustum_trace_idx]['name'] = f'Drone ({source.upper()})'
+
+            # Update frustum fill mesh (4 corners of front face)
+            patched_fig['data'][mesh_trace_idx]['x'] = [c_tl[0], c_tr[0], c_br[0], c_bl[0]]
+            patched_fig['data'][mesh_trace_idx]['y'] = [c_tl[1], c_tr[1], c_br[1], c_bl[1]]
+            patched_fig['data'][mesh_trace_idx]['z'] = [c_tl[2], c_tr[2], c_br[2], c_bl[2]]
+            patched_fig['data'][mesh_trace_idx]['color'] = frustum_color
 
             # Calculate and apply third-person camera if in auto-follow mode
             if camera_mode == 'auto':
@@ -580,27 +643,35 @@ def create_dash_app(localization_state):
                     offset_up=CAMERA_OFFSET_UP,
                     look_ahead=CAMERA_LOOK_AHEAD
                 )
-
-                # Apply camera update with changing uirevision to force camera update
-                # Use perspective projection for better close-up rendering
                 camera_config['projection'] = {'type': 'perspective'}
-
-                fig.update_layout(
-                    scene_camera=camera_config,
-                    uirevision=n  # Change uirevision to force camera update
-                )
+                patched_fig['layout']['scene']['camera'] = camera_config
+                patched_fig['layout']['uirevision'] = n
             else:
-                # Manual mode: preserve user camera control
-                fig.update_layout(uirevision='constant')
+                patched_fig['layout']['uirevision'] = 'constant'
 
-            # 3. Build status text
+            # First update needs full figure, subsequent use Patch
+            if first_update[0]:
+                first_update[0] = False
+                # Apply updates to base_fig for first render
+                base_fig.data[frustum_trace_idx].x = frustum_x
+                base_fig.data[frustum_trace_idx].y = frustum_y
+                base_fig.data[frustum_trace_idx].z = frustum_z
+                base_fig.data[frustum_trace_idx].line.color = frustum_color
+                base_fig.data[mesh_trace_idx].x = [c_tl[0], c_tr[0], c_br[0], c_bl[0]]
+                base_fig.data[mesh_trace_idx].y = [c_tl[1], c_tr[1], c_br[1], c_bl[1]]
+                base_fig.data[mesh_trace_idx].z = [c_tl[2], c_tr[2], c_br[2], c_bl[2]]
+                base_fig.data[mesh_trace_idx].color = frustum_color
+                fig_output = base_fig
+            else:
+                fig_output = patched_fig
+
+            # Build status text
             logger.debug("  Building status text...")
             pos = drone_pos
             rot = Rotation.from_matrix(drone_rot)
             yaw, pitch, roll = rot.as_euler('zyx', degrees=True)
 
             # Get source and calibration info
-            source = latest['source']
             calibrated = latest['calibrated']
             source_color = 'green' if source == 'hloc' else 'orange'
 
@@ -632,7 +703,7 @@ def create_dash_app(localization_state):
                 )
 
             logger.debug("  Visualization rendered successfully")
-            return fig, html.Div(status_children)
+            return fig_output, html.Div(status_children)
         except Exception as e:
             logger.error(f"  Error rendering visualization: {e}")
             import traceback
