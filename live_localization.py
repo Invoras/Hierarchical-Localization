@@ -23,6 +23,7 @@ import threading
 import copy
 import json
 from datetime import datetime
+import time
 from pathlib import Path
 import requests
 import cv2
@@ -32,7 +33,7 @@ import torch
 import h5py
 import pycolmap
 from scipy.spatial.transform import Rotation
-from dash import Dash, dcc, html, Input, Output, Patch, no_update
+from dash import Dash, dcc, html, Input, Output, State, Patch, no_update
 import plotly.graph_objects as go
 
 from hloc import extract_features, match_features, pairs_from_retrieval
@@ -533,9 +534,13 @@ def create_dash_app(localization_state):
             )
         ], style={'padding': '10px 20px', 'backgroundColor': '#f0f0f0', 'marginBottom': '10px'}),
 
+        # Store for camera state in manual mode
+        dcc.Store(id='camera-store', data=None),
+
         # 3D visualization
         dcc.Graph(
             id='3d-plot',
+            figure=base_fig,
             style={'height': '80vh'}
         ),
 
@@ -544,17 +549,59 @@ def create_dash_app(localization_state):
             id='interval-component',
             interval=DASH_REFRESH_INTERVAL,  # milliseconds
             n_intervals=0
-        )
+        ),
+
     ])
+
+    # Clientside callback to capture camera state when user interacts with the plot
+    app.clientside_callback(
+        """
+        function(relayoutData) {
+            if (!relayoutData) {
+                return window.dash_clientside.no_update;
+            }
+            // Check if camera data is in relayoutData
+            if ('scene.camera' in relayoutData) {
+                return relayoutData['scene.camera'];
+            }
+            // Also check for individual camera properties
+            if ('scene.camera.eye.x' in relayoutData) {
+                return {
+                    eye: {
+                        x: relayoutData['scene.camera.eye.x'],
+                        y: relayoutData['scene.camera.eye.y'],
+                        z: relayoutData['scene.camera.eye.z']
+                    },
+                    center: {
+                        x: relayoutData['scene.camera.center.x'] || 0,
+                        y: relayoutData['scene.camera.center.y'] || 0,
+                        z: relayoutData['scene.camera.center.z'] || 0
+                    },
+                    up: {
+                        x: relayoutData['scene.camera.up.x'] || 0,
+                        y: relayoutData['scene.camera.up.y'] || 1,
+                        z: relayoutData['scene.camera.up.z'] || 0
+                    }
+                };
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output('camera-store', 'data'),
+        Input('3d-plot', 'relayoutData'),
+        prevent_initial_call=True
+    )
 
     @app.callback(
         [Output('3d-plot', 'figure'),
          Output('status-text', 'children')],
         [Input('interval-component', 'n_intervals'),
-         Input('camera-mode-toggle', 'value')]
+         Input('camera-mode-toggle', 'value')],
+        [State('camera-store', 'data')]
     )
-    def update_visualization(n, camera_mode):
+    def update_visualization(n, camera_mode, stored_camera):
         """Update 3D visualization with latest localization data using Patch for speed"""
+
         # Get latest localization data from shared state
         latest = localization_state.get_latest()
         logger.debug(f"Dash callback: latest={latest is not None}")
@@ -632,7 +679,7 @@ def create_dash_app(localization_state):
             patched_fig['data'][mesh_trace_idx]['z'] = [c_tl[2], c_tr[2], c_br[2], c_bl[2]]
             patched_fig['data'][mesh_trace_idx]['color'] = frustum_color
 
-            # Calculate and apply third-person camera if in auto-follow mode
+            # Calculate and apply camera based on mode
             if camera_mode == 'auto':
                 logger.debug("  Calculating third-person camera position...")
                 camera_config = calculate_third_person_camera(
@@ -647,7 +694,10 @@ def create_dash_app(localization_state):
                 patched_fig['layout']['scene']['camera'] = camera_config
                 patched_fig['layout']['uirevision'] = n
             else:
-                patched_fig['layout']['uirevision'] = 'constant'
+                # Manual mode: apply stored camera to preserve user's view
+                if stored_camera:
+                    patched_fig['layout']['scene']['camera'] = stored_camera
+                patched_fig['layout']['uirevision'] = 'manual'
 
             # First update needs full figure, subsequent use Patch
             if first_update[0]:
