@@ -54,7 +54,7 @@ WARMUP_DELAY = 10  # seconds - wait for SFU bandwidth estimation to ramp up to f
 LOCALIZE_INTERVAL = 20.0  # seconds - localize drone position every 20 seconds (changed from 5.0 for telemetry-based dead reckoning)
 DASH_PORT = 8050
 DASH_HOST = "127.0.0.1"
-DASH_REFRESH_INTERVAL = 500  # milliseconds - browser refresh rate (increased to reduce load)
+DASH_REFRESH_INTERVAL = 100  # milliseconds - browser refresh rate (increased to reduce load)
 
 # Third-person camera configuration
 CAMERA_OFFSET_BACK = 3.5    # Meters behind the drone
@@ -387,6 +387,9 @@ class HybridLocalizationState:
             }
 
 
+# Cache for sparse model bounds (computed once per model)
+_bounds_cache = {}
+
 def calculate_third_person_camera(
     drone_world_pos: np.ndarray,
     drone_rotation_matrix: np.ndarray,
@@ -425,20 +428,21 @@ def calculate_third_person_camera(
     # Camera looks at drone position (or slightly ahead)
     look_at_world = drone_world_pos + forward_world * look_ahead
 
-    # Get data bounds for coordinate transformation
-    # Calculate bounds directly from 3D points (more compatible across pycolmap versions)
-    all_points = np.array([p3D.xyz for p3D in sparse_model.points3D.values()])
+    # Get cached bounds or compute them (expensive operation, only do once)
+    model_id = id(sparse_model)
+    if model_id not in _bounds_cache:
+        all_points = np.array([p3D.xyz for p3D in sparse_model.points3D.values()])
+        data_min = np.percentile(all_points, 0.1, axis=0)
+        data_max = np.percentile(all_points, 99.9, axis=0)
+        data_center = (data_min + data_max) / 2.0
+        data_extent = data_max - data_min
+        max_extent = np.max(data_extent)
+        scale_factor = 2.0 / max_extent
+        _bounds_cache[model_id] = (data_center, scale_factor)
 
-    # Use percentiles to filter outliers (similar to compute_bounding_box)
-    data_min = np.percentile(all_points, 0.1, axis=0)
-    data_max = np.percentile(all_points, 99.9, axis=0)
-    data_center = (data_min + data_max) / 2.0
-    data_extent = data_max - data_min
+    data_center, scale_factor = _bounds_cache[model_id]
 
     # Convert to Plotly domain coordinates
-    max_extent = np.max(data_extent)
-    scale_factor = 2.0 / max_extent
-
     camera_domain = (camera_pos_world - data_center) * scale_factor
     target_domain = (look_at_world - data_center) * scale_factor
 
@@ -537,6 +541,9 @@ def create_dash_app(localization_state):
         # Store for camera state in manual mode
         dcc.Store(id='camera-store', data=None),
 
+        # Store for tracking last camera interaction time
+        dcc.Store(id='camera-interaction-time', data=0),
+
         # 3D visualization
         dcc.Graph(
             id='3d-plot',
@@ -556,17 +563,18 @@ def create_dash_app(localization_state):
     # Clientside callback to capture camera state when user interacts with the plot
     app.clientside_callback(
         """
-        function(relayoutData) {
+        function(relayoutData, currentStoredCamera) {
             if (!relayoutData) {
-                return window.dash_clientside.no_update;
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
             }
             // Check if camera data is in relayoutData
+            let cameraData = null;
             if ('scene.camera' in relayoutData) {
-                return relayoutData['scene.camera'];
+                cameraData = relayoutData['scene.camera'];
             }
             // Also check for individual camera properties
-            if ('scene.camera.eye.x' in relayoutData) {
-                return {
+            else if ('scene.camera.eye.x' in relayoutData) {
+                cameraData = {
                     eye: {
                         x: relayoutData['scene.camera.eye.x'],
                         y: relayoutData['scene.camera.eye.y'],
@@ -584,11 +592,33 @@ def create_dash_app(localization_state):
                     }
                 };
             }
-            return window.dash_clientside.no_update;
+            if (cameraData) {
+                // Check if camera actually changed from what we have stored
+                // (to avoid triggering debounce from our own programmatic updates)
+                let cameraChanged = true;
+                if (currentStoredCamera && currentStoredCamera.eye) {
+                    const threshold = 0.0001;
+                    const eyeMatch = Math.abs(cameraData.eye.x - currentStoredCamera.eye.x) < threshold &&
+                                     Math.abs(cameraData.eye.y - currentStoredCamera.eye.y) < threshold &&
+                                     Math.abs(cameraData.eye.z - currentStoredCamera.eye.z) < threshold;
+                    if (eyeMatch) {
+                        cameraChanged = false;
+                    }
+                }
+                if (cameraChanged) {
+                    return [cameraData, Date.now()];
+                } else {
+                    // Camera didn't change (programmatic update), just store it without updating timestamp
+                    return [cameraData, window.dash_clientside.no_update];
+                }
+            }
+            return [window.dash_clientside.no_update, window.dash_clientside.no_update];
         }
         """,
-        Output('camera-store', 'data'),
-        Input('3d-plot', 'relayoutData'),
+        [Output('camera-store', 'data'),
+         Output('camera-interaction-time', 'data')],
+        [Input('3d-plot', 'relayoutData')],
+        [State('camera-store', 'data')],
         prevent_initial_call=True
     )
 
@@ -597,10 +627,16 @@ def create_dash_app(localization_state):
          Output('status-text', 'children')],
         [Input('interval-component', 'n_intervals'),
          Input('camera-mode-toggle', 'value')],
-        [State('camera-store', 'data')]
+        [State('camera-store', 'data'),
+         State('camera-interaction-time', 'data')]
     )
-    def update_visualization(n, camera_mode, stored_camera):
+    def update_visualization(n, camera_mode, stored_camera, last_interaction_time):
         """Update 3D visualization with latest localization data using Patch for speed"""
+        # In manual mode, skip updates for 1 second after camera interaction
+        if camera_mode == 'manual' and last_interaction_time:
+            elapsed_ms = time.time() * 1000 - last_interaction_time
+            if elapsed_ms < 2000:  # 2 second debounce
+                return no_update, no_update
 
         # Get latest localization data from shared state
         latest = localization_state.get_latest()
