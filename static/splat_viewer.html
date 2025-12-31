@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gaussian Splat Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            overflow: hidden;
+            background: #1a1a2e;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        #canvas-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 18px;
+            text-align: center;
+            z-index: 100;
+        }
+        #loading .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #333;
+            border-top-color: #00ff88;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 100;
+        }
+        #error {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ff6b6b;
+            background: rgba(0,0,0,0.9);
+            padding: 20px;
+            border-radius: 8px;
+            display: none;
+            z-index: 100;
+            max-width: 80%;
+        }
+        /* Drone frustum overlay using SVG */
+        #frustum-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 50;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="canvas"></canvas>
+        <svg id="frustum-overlay"></svg>
+    </div>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading Gaussian Splat...</div>
+    </div>
+    <div id="info">Initializing...</div>
+    <div id="error"></div>
+
+    <script type="module">
+        // Configuration
+        const SPLAT_PATH = '/splat/point_cloud.ply';
+        const DRONE_API = '/api/drone_position';
+        const UPDATE_INTERVAL = 100; // ms
+
+        // Globals
+        let camera, projectionMatrix;
+        let cameraMode = 'auto'; // 'auto' or 'manual'
+        let dronePosition = null;
+        let droneRotation = null;
+        let droneSource = null;
+
+        // Camera parameters
+        let viewMatrix = new Float32Array(16);
+        let cameraPosition = [0, 0, 5];
+        let cameraTarget = [0, 0, 0];
+        let cameraUp = [0, 1, 0];
+
+        // Mouse interaction
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+        let orbitAngles = { theta: 0, phi: Math.PI / 4 };
+        let orbitRadius = 5;
+
+        // Auto-follow parameters
+        const CAMERA_OFFSET_BACK = 3.5;
+        const CAMERA_OFFSET_UP = 1.5;
+        const CAMERA_LERP_SPEED = 0.1;
+
+        // WebGL rendering for Gaussian Splats
+        let gl, program;
+        let splatData = null;
+        let vertexBuffer, indexBuffer;
+        let numSplats = 0;
+
+        async function init() {
+            const canvas = document.getElementById('canvas');
+            gl = canvas.getContext('webgl2', { antialias: true });
+
+            if (!gl) {
+                showError('WebGL 2 not supported');
+                return;
+            }
+
+            // Setup canvas size
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+
+            // Setup mouse controls
+            setupMouseControls(canvas);
+
+            // Listen for messages from parent
+            window.addEventListener('message', handleMessage);
+
+            // Load splat data
+            await loadSplat();
+
+            // Start render loop
+            requestAnimationFrame(render);
+
+            // Start polling for drone position
+            setInterval(updateDronePosition, UPDATE_INTERVAL);
+        }
+
+        function resizeCanvas() {
+            const canvas = document.getElementById('canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            if (gl) {
+                gl.viewport(0, 0, canvas.width, canvas.height);
+            }
+            updateProjectionMatrix();
+        }
+
+        function updateProjectionMatrix() {
+            const canvas = document.getElementById('canvas');
+            const aspect = canvas.width / canvas.height;
+            const fov = 75 * Math.PI / 180;
+            const near = 0.1;
+            const far = 1000;
+
+            projectionMatrix = new Float32Array(16);
+            const f = 1.0 / Math.tan(fov / 2);
+            projectionMatrix[0] = f / aspect;
+            projectionMatrix[5] = f;
+            projectionMatrix[10] = (far + near) / (near - far);
+            projectionMatrix[11] = -1;
+            projectionMatrix[14] = (2 * far * near) / (near - far);
+        }
+
+        function setupMouseControls(canvas) {
+            canvas.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            });
+
+            canvas.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                if (cameraMode !== 'manual') return;
+
+                const dx = e.clientX - lastMouseX;
+                const dy = e.clientY - lastMouseY;
+
+                orbitAngles.theta -= dx * 0.005;
+                orbitAngles.phi = Math.max(0.1, Math.min(Math.PI - 0.1, orbitAngles.phi + dy * 0.005));
+
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            });
+
+            canvas.addEventListener('mouseup', () => { isDragging = false; });
+            canvas.addEventListener('mouseleave', () => { isDragging = false; });
+
+            canvas.addEventListener('wheel', (e) => {
+                if (cameraMode !== 'manual') return;
+                orbitRadius = Math.max(1, Math.min(50, orbitRadius + e.deltaY * 0.01));
+                e.preventDefault();
+            });
+        }
+
+        async function loadSplat() {
+            try {
+                document.getElementById('loading-text').textContent = 'Fetching Gaussian Splat file...';
+
+                const response = await fetch(SPLAT_PATH);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const contentLength = response.headers.get('content-length');
+                const totalSize = contentLength ? parseInt(contentLength) : 0;
+
+                // Read with progress
+                const reader = response.body.getReader();
+                const chunks = [];
+                let receivedLength = 0;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    chunks.push(value);
+                    receivedLength += value.length;
+
+                    if (totalSize > 0) {
+                        const pct = Math.round((receivedLength / totalSize) * 100);
+                        document.getElementById('loading-text').textContent =
+                            `Loading Gaussian Splat... ${pct}% (${(receivedLength / 1024 / 1024).toFixed(1)}MB)`;
+                    }
+                }
+
+                document.getElementById('loading-text').textContent = 'Parsing PLY file...';
+                const buffer = new Uint8Array(receivedLength);
+                let position = 0;
+                for (const chunk of chunks) {
+                    buffer.set(chunk, position);
+                    position += chunk.length;
+                }
+
+                // Parse PLY
+                await parsePLY(buffer);
+
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('info').textContent = `Loaded ${numSplats.toLocaleString()} splats. Waiting for drone data...`;
+
+            } catch (error) {
+                console.error('Failed to load splat:', error);
+                showError(`Error loading splat: ${error.message}`);
+            }
+        }
+
+        async function parsePLY(buffer) {
+            // Find header end
+            const decoder = new TextDecoder();
+            let headerEnd = 0;
+            for (let i = 0; i < Math.min(buffer.length, 10000); i++) {
+                if (buffer[i] === 0x0A) { // newline
+                    const line = decoder.decode(buffer.slice(headerEnd, i)).trim();
+                    if (line === 'end_header') {
+                        headerEnd = i + 1;
+                        break;
+                    }
+                    headerEnd = i + 1;
+                }
+            }
+
+            // Parse header
+            const header = decoder.decode(buffer.slice(0, headerEnd));
+            const vertexMatch = header.match(/element vertex (\d+)/);
+            if (!vertexMatch) throw new Error('Invalid PLY: no vertex count');
+
+            numSplats = parseInt(vertexMatch[1]);
+            document.getElementById('loading-text').textContent = `Processing ${numSplats.toLocaleString()} splats...`;
+
+            // Parse properties to get byte offsets
+            const properties = [];
+            const propRegex = /property (\w+) (\w+)/g;
+            let match;
+            while ((match = propRegex.exec(header)) !== null) {
+                const [, type, name] = match;
+                const size = type === 'float' ? 4 : (type === 'uchar' ? 1 : 4);
+                properties.push({ name, type, size });
+            }
+
+            // Calculate stride
+            const stride = properties.reduce((sum, p) => sum + p.size, 0);
+
+            // Find property offsets
+            let offset = 0;
+            const offsets = {};
+            for (const prop of properties) {
+                offsets[prop.name] = offset;
+                offset += prop.size;
+            }
+
+            // Extract positions and colors for rendering
+            const dataView = new DataView(buffer.buffer, headerEnd);
+            const positions = new Float32Array(numSplats * 3);
+            const colors = new Float32Array(numSplats * 3);
+            const sizes = new Float32Array(numSplats);
+
+            for (let i = 0; i < numSplats; i++) {
+                const base = i * stride;
+
+                // Position
+                // Rotate scene 180° around Z by flipping X/Y
+                positions[i * 3] = -dataView.getFloat32(base + offsets.x, true);
+                positions[i * 3 + 1] = -dataView.getFloat32(base + offsets.y, true);
+                positions[i * 3 + 2] = dataView.getFloat32(base + offsets.z, true);
+
+                // Color from DC coefficients (SH degree 0)
+                // Convert from SH to RGB: C = 0.5 + SH_C0 * f_dc
+                const SH_C0 = 0.28209479177387814;
+                if (offsets.f_dc_0 !== undefined) {
+                    colors[i * 3] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dataView.getFloat32(base + offsets.f_dc_0, true)));
+                    colors[i * 3 + 1] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dataView.getFloat32(base + offsets.f_dc_1, true)));
+                    colors[i * 3 + 2] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dataView.getFloat32(base + offsets.f_dc_2, true)));
+                } else {
+                    colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = 0.5;
+                }
+
+                // Size from scale (use average)
+                if (offsets.scale_0 !== undefined) {
+                    const s0 = Math.exp(dataView.getFloat32(base + offsets.scale_0, true));
+                    const s1 = Math.exp(dataView.getFloat32(base + offsets.scale_1, true));
+                    const s2 = Math.exp(dataView.getFloat32(base + offsets.scale_2, true));
+                    sizes[i] = (s0 + s1 + s2) / 3 * 10;
+                } else {
+                    sizes[i] = 0.01;
+                }
+
+                if (i % 100000 === 0) {
+                    document.getElementById('loading-text').textContent =
+                        `Processing splats... ${Math.round(i / numSplats * 100)}%`;
+                    await new Promise(r => setTimeout(r, 0)); // Yield to UI
+                }
+            }
+
+            // Calculate center for initial camera position
+            let cx = 0, cy = 0, cz = 0;
+            for (let i = 0; i < numSplats; i++) {
+                cx += positions[i * 3];
+                cy += positions[i * 3 + 1];
+                cz += positions[i * 3 + 2];
+            }
+            cx /= numSplats; cy /= numSplats; cz /= numSplats;
+            cameraTarget = [cx, cy, cz];
+            orbitRadius = 5;
+
+            // Setup WebGL buffers and shaders
+            setupWebGL(positions, colors, sizes);
+        }
+
+        function setupWebGL(positions, colors, sizes) {
+            // Vertex shader
+            const vsSource = `#version 300 es
+                in vec3 aPosition;
+                in vec3 aColor;
+                in float aSize;
+
+                uniform mat4 uProjection;
+                uniform mat4 uView;
+
+                out vec3 vColor;
+
+                void main() {
+                    vec4 viewPos = uView * vec4(aPosition, 1.0);
+                    gl_Position = uProjection * viewPos;
+                    gl_PointSize = aSize * 100.0 / -viewPos.z;
+                    vColor = aColor;
+                }
+            `;
+
+            // Fragment shader
+            const fsSource = `#version 300 es
+                precision highp float;
+
+                in vec3 vColor;
+                out vec4 fragColor;
+
+                void main() {
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    float dist = length(coord);
+                    if (dist > 0.5) discard;
+
+                    float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
+                    fragColor = vec4(vColor, alpha);
+                }
+            `;
+
+            // Compile shaders
+            const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+            const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+
+            program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                throw new Error('Shader program failed: ' + gl.getProgramInfoLog(program));
+            }
+
+            // Create buffers
+            const posBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+            const colorBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+
+            const sizeBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, sizes, gl.STATIC_DRAW);
+
+            // Setup VAO
+            const vao = gl.createVertexArray();
+            gl.bindVertexArray(vao);
+
+            const aPosition = gl.getAttribLocation(program, 'aPosition');
+            gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+            gl.enableVertexAttribArray(aPosition);
+            gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
+
+            const aColor = gl.getAttribLocation(program, 'aColor');
+            gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+            gl.enableVertexAttribArray(aColor);
+            gl.vertexAttribPointer(aColor, 3, gl.FLOAT, false, 0, 0);
+
+            const aSize = gl.getAttribLocation(program, 'aSize');
+            gl.bindBuffer(gl.ARRAY_BUFFER, sizeBuffer);
+            gl.enableVertexAttribArray(aSize);
+            gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
+
+            // Store for rendering
+            splatData = { vao, posBuffer, colorBuffer, sizeBuffer };
+        }
+
+        function compileShader(type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                throw new Error('Shader compile failed: ' + gl.getShaderInfoLog(shader));
+            }
+            return shader;
+        }
+
+        function updateCamera() {
+            if (cameraMode === 'auto' && dronePosition && droneRotation) {
+                // Auto-follow: position camera behind drone
+                const forward = [droneRotation[2], droneRotation[5], droneRotation[8]];
+                const up = [-droneRotation[1], -droneRotation[4], -droneRotation[7]];
+
+                const targetCam = [
+                    dronePosition[0] - forward[0] * CAMERA_OFFSET_BACK + up[0] * CAMERA_OFFSET_UP,
+                    dronePosition[1] - forward[1] * CAMERA_OFFSET_BACK + up[1] * CAMERA_OFFSET_UP,
+                    dronePosition[2] - forward[2] * CAMERA_OFFSET_BACK + up[2] * CAMERA_OFFSET_UP
+                ];
+
+                // Lerp camera position
+                cameraPosition[0] += (targetCam[0] - cameraPosition[0]) * CAMERA_LERP_SPEED;
+                cameraPosition[1] += (targetCam[1] - cameraPosition[1]) * CAMERA_LERP_SPEED;
+                cameraPosition[2] += (targetCam[2] - cameraPosition[2]) * CAMERA_LERP_SPEED;
+
+                cameraTarget[0] += (dronePosition[0] - cameraTarget[0]) * CAMERA_LERP_SPEED;
+                cameraTarget[1] += (dronePosition[1] - cameraTarget[1]) * CAMERA_LERP_SPEED;
+                cameraTarget[2] += (dronePosition[2] - cameraTarget[2]) * CAMERA_LERP_SPEED;
+
+                cameraUp = up;
+            } else {
+                // Manual orbit camera
+                cameraPosition[0] = cameraTarget[0] + orbitRadius * Math.sin(orbitAngles.phi) * Math.cos(orbitAngles.theta);
+                cameraPosition[1] = cameraTarget[1] + orbitRadius * Math.cos(orbitAngles.phi);
+                cameraPosition[2] = cameraTarget[2] + orbitRadius * Math.sin(orbitAngles.phi) * Math.sin(orbitAngles.theta);
+                cameraUp = [0, 1, 0];
+            }
+
+            // Build view matrix (lookAt)
+            lookAt(viewMatrix, cameraPosition, cameraTarget, cameraUp);
+        }
+
+        function lookAt(out, eye, center, up) {
+            const zAxis = normalize([eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]]);
+            const xAxis = normalize(cross(up, zAxis));
+            const yAxis = cross(zAxis, xAxis);
+
+            out[0] = xAxis[0]; out[1] = yAxis[0]; out[2] = zAxis[0]; out[3] = 0;
+            out[4] = xAxis[1]; out[5] = yAxis[1]; out[6] = zAxis[1]; out[7] = 0;
+            out[8] = xAxis[2]; out[9] = yAxis[2]; out[10] = zAxis[2]; out[11] = 0;
+            out[12] = -dot(xAxis, eye); out[13] = -dot(yAxis, eye); out[14] = -dot(zAxis, eye); out[15] = 1;
+        }
+
+        function normalize(v) {
+            const len = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            return len > 0 ? [v[0]/len, v[1]/len, v[2]/len] : [0, 0, 0];
+        }
+
+        function cross(a, b) {
+            return [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
+        }
+
+        function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+        function render() {
+            if (!splatData) {
+                requestAnimationFrame(render);
+                return;
+            }
+
+            updateCamera();
+
+            gl.clearColor(0.1, 0.1, 0.18, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthMask(false);
+
+            gl.useProgram(program);
+
+            const uProjection = gl.getUniformLocation(program, 'uProjection');
+            const uView = gl.getUniformLocation(program, 'uView');
+
+            gl.uniformMatrix4fv(uProjection, false, projectionMatrix);
+            gl.uniformMatrix4fv(uView, false, viewMatrix);
+
+            gl.bindVertexArray(splatData.vao);
+            gl.drawArrays(gl.POINTS, 0, numSplats);
+
+            // Draw drone frustum overlay
+            drawDroneFrustum();
+
+            requestAnimationFrame(render);
+        }
+
+        function drawDroneFrustum() {
+            if (!dronePosition || !droneRotation) return;
+
+            // Project drone position to screen
+            const mvp = multiplyMatrices(projectionMatrix, viewMatrix);
+            const screenPos = projectToScreen(dronePosition, mvp);
+
+            if (!screenPos) return; // Behind camera
+
+            // Draw frustum using SVG overlay
+            const svg = document.getElementById('frustum-overlay');
+            const color = droneSource === 'hloc' ? '#00ff88' : '#ffa500';
+
+            // Frustum corners in local space
+            const depth = 0.25;
+            const halfW = depth * 0.2 * (16/9);
+            const halfH = depth * 0.2;
+
+            const R = droneRotation;
+            const forward = [R[2], R[5], R[8]];
+            const right = [R[0], R[3], R[6]];
+            const up = [-R[1], -R[4], -R[7]];
+
+            const centerFront = [
+                dronePosition[0] + forward[0] * depth,
+                dronePosition[1] + forward[1] * depth,
+                dronePosition[2] + forward[2] * depth
+            ];
+
+            const corners = [
+                [centerFront[0] + up[0]*halfH - right[0]*halfW, centerFront[1] + up[1]*halfH - right[1]*halfW, centerFront[2] + up[2]*halfH - right[2]*halfW],
+                [centerFront[0] + up[0]*halfH + right[0]*halfW, centerFront[1] + up[1]*halfH + right[1]*halfW, centerFront[2] + up[2]*halfH + right[2]*halfW],
+                [centerFront[0] - up[0]*halfH + right[0]*halfW, centerFront[1] - up[1]*halfH + right[1]*halfW, centerFront[2] - up[2]*halfH + right[2]*halfW],
+                [centerFront[0] - up[0]*halfH - right[0]*halfW, centerFront[1] - up[1]*halfH - right[1]*halfW, centerFront[2] - up[2]*halfH - right[2]*halfW]
+            ];
+
+            const screenCorners = corners.map(c => projectToScreen(c, mvp)).filter(c => c);
+            const screenCenter = screenPos;
+
+            if (screenCorners.length < 4) {
+                svg.innerHTML = '';
+                return;
+            }
+
+            // Build SVG path
+            let path = '';
+            // Lines from center to corners
+            for (const corner of screenCorners) {
+                path += `<line x1="${screenCenter.x}" y1="${screenCenter.y}" x2="${corner.x}" y2="${corner.y}" stroke="${color}" stroke-width="2"/>`;
+            }
+            // Rectangle around corners
+            for (let i = 0; i < 4; i++) {
+                const c1 = screenCorners[i];
+                const c2 = screenCorners[(i + 1) % 4];
+                path += `<line x1="${c1.x}" y1="${c1.y}" x2="${c2.x}" y2="${c2.y}" stroke="${color}" stroke-width="2"/>`;
+            }
+            // Fill polygon
+            const polyPoints = screenCorners.map(c => `${c.x},${c.y}`).join(' ');
+            path += `<polygon points="${polyPoints}" fill="${color}" fill-opacity="0.3"/>`;
+
+            svg.innerHTML = path;
+        }
+
+        function projectToScreen(worldPos, mvp) {
+            const clip = [
+                mvp[0]*worldPos[0] + mvp[4]*worldPos[1] + mvp[8]*worldPos[2] + mvp[12],
+                mvp[1]*worldPos[0] + mvp[5]*worldPos[1] + mvp[9]*worldPos[2] + mvp[13],
+                mvp[2]*worldPos[0] + mvp[6]*worldPos[1] + mvp[10]*worldPos[2] + mvp[14],
+                mvp[3]*worldPos[0] + mvp[7]*worldPos[1] + mvp[11]*worldPos[2] + mvp[15]
+            ];
+
+            if (clip[3] <= 0) return null; // Behind camera
+
+            const ndc = [clip[0]/clip[3], clip[1]/clip[3]];
+            const canvas = document.getElementById('canvas');
+
+            return {
+                x: (ndc[0] * 0.5 + 0.5) * canvas.width,
+                y: (1 - (ndc[1] * 0.5 + 0.5)) * canvas.height
+            };
+        }
+
+        function multiplyMatrices(a, b) {
+            const out = new Float32Array(16);
+            for (let i = 0; i < 4; i++) {
+                for (let j = 0; j < 4; j++) {
+                    out[i * 4 + j] = a[j] * b[i * 4] + a[4 + j] * b[i * 4 + 1] +
+                                     a[8 + j] * b[i * 4 + 2] + a[12 + j] * b[i * 4 + 3];
+                }
+            }
+            return out;
+        }
+
+        async function updateDronePosition() {
+            try {
+                const response = await fetch(DRONE_API);
+                if (!response.ok) return;
+
+                const data = await response.json();
+                if (!data || !data.position) return;
+
+                // Apply the same 180° Z-rotation to drone pose (flip X/Y for position)
+                dronePosition = [-data.position[0], -data.position[1], data.position[2]];
+
+                // For rotation matrix, multiply by Rz(180) = [[-1,0,0],[0,-1,0],[0,0,1]]
+                // This negates the first two rows of the rotation matrix
+                const R = data.rotation;
+                droneRotation = [
+                    -R[0], -R[1], -R[2],  // Row 0 negated
+                    -R[3], -R[4], -R[5],  // Row 1 negated
+                     R[6],  R[7],  R[8]   // Row 2 unchanged
+                ];
+                droneSource = data.source;
+
+                // Update info
+                document.getElementById('info').textContent =
+                    `Drone: [${data.position[0].toFixed(2)}, ${data.position[1].toFixed(2)}, ${data.position[2].toFixed(2)}] | ` +
+                    `Source: ${data.source?.toUpperCase() || 'N/A'} | ` +
+                    `Mode: ${cameraMode === 'auto' ? 'Auto-Follow' : 'Free Camera'} | ` +
+                    `Splats: ${numSplats.toLocaleString()}`;
+
+            } catch (error) {
+                // Silently ignore
+            }
+        }
+
+        function handleMessage(event) {
+            const data = event.data;
+            if (data.type === 'setCameraMode') {
+                cameraMode = data.mode;
+            }
+        }
+
+        function showError(message) {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').style.display = 'block';
+            document.getElementById('error').textContent = message;
+        }
+
+        // Initialize
+        init();
+    </script>
+</body>
+</html>

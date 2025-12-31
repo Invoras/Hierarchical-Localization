@@ -35,6 +35,7 @@ import pycolmap
 from scipy.spatial.transform import Rotation
 from dash import Dash, dcc, html, Input, Output, State, Patch, no_update
 import plotly.graph_objects as go
+from flask import jsonify, send_from_directory
 
 from hloc import extract_features, match_features, pairs_from_retrieval
 from hloc.localize_sfm import QueryLocalizer, pose_from_cluster
@@ -470,7 +471,36 @@ def calculate_third_person_camera(
 
 def create_dash_app(localization_state):
     """Create Dash app for real-time 3D visualization"""
-    app = Dash(__name__)
+    app = Dash(__name__, suppress_callback_exceptions=True)
+
+    # Add Flask routes for Gaussian Splat viewer
+    @app.server.route('/api/drone_position')
+    def get_drone_position():
+        """API endpoint for Gaussian Splat viewer to get drone position"""
+        latest = localization_state.get_latest()
+        if latest is None:
+            return jsonify({'error': 'No position data'}), 404
+
+        return jsonify({
+            'position': latest['position'].tolist(),
+            'rotation': latest['rotation'].flatten().tolist(),  # 3x3 matrix as flat array
+            'source': latest['source'],
+            'calibrated': latest['calibrated'],
+            'inliers': latest['inliers'],
+            'total_matches': latest['total_matches'],
+            'frame_num': latest['frame_num'],
+        })
+
+    @app.server.route('/splat/<path:filename>')
+    def serve_splat(filename):
+        """Serve Gaussian Splat PLY file"""
+        splat_dir = Path('final_inputs/v1/splats')
+        return send_from_directory(splat_dir, filename)
+
+    @app.server.route('/static/<path:filename>')
+    def serve_static(filename):
+        """Serve static files (splat viewer HTML/JS)"""
+        return send_from_directory('static', filename)
 
     # Pre-render the sparse reconstruction ONCE (cached)
     logger.info("Pre-rendering sparse reconstruction for visualization...")
@@ -523,19 +553,37 @@ def create_dash_app(localization_state):
         # Status display
         html.Div(id='status-text', style={'padding': '20px', 'fontSize': '14px'}),
 
-        # Camera mode toggle
+        # Controls row
         html.Div([
-            html.Label("Camera Mode:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.RadioItems(
-                id='camera-mode-toggle',
-                options=[
-                    {'label': ' Auto-Follow Drone', 'value': 'auto'},
-                    {'label': ' Free Camera (Manual Control)', 'value': 'manual'}
-                ],
-                value='auto',  # Default to auto-follow
-                labelStyle={'display': 'inline-block', 'marginRight': '20px'},
-                style={'display': 'inline-block'}
-            )
+            # Camera mode toggle
+            html.Div([
+                html.Label("Camera Mode:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+                dcc.RadioItems(
+                    id='camera-mode-toggle',
+                    options=[
+                        {'label': ' Auto-Follow Drone', 'value': 'auto'},
+                        {'label': ' Free Camera (Manual Control)', 'value': 'manual'}
+                    ],
+                    value='auto',  # Default to auto-follow
+                    labelStyle={'display': 'inline-block', 'marginRight': '20px'},
+                    style={'display': 'inline-block'}
+                )
+            ], style={'display': 'inline-block', 'marginRight': '40px'}),
+
+            # Visualization mode toggle
+            html.Div([
+                html.Label("Visualization:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+                dcc.RadioItems(
+                    id='viz-mode-toggle',
+                    options=[
+                        {'label': ' Sparse Point Cloud', 'value': 'sparse'},
+                        {'label': ' Gaussian Splat', 'value': 'splat'}
+                    ],
+                    value='sparse',  # Default to sparse
+                    labelStyle={'display': 'inline-block', 'marginRight': '20px'},
+                    style={'display': 'inline-block'}
+                )
+            ], style={'display': 'inline-block'}),
         ], style={'padding': '10px 20px', 'backgroundColor': '#f0f0f0', 'marginBottom': '10px'}),
 
         # Store for camera state in manual mode
@@ -544,12 +592,21 @@ def create_dash_app(localization_state):
         # Store for tracking last camera interaction time
         dcc.Store(id='camera-interaction-time', data=0),
 
-        # 3D visualization
-        dcc.Graph(
-            id='3d-plot',
-            figure=base_fig,
-            style={'height': '80vh'}
-        ),
+        # 3D visualization container (shows either Plotly or iframe)
+        html.Div(id='viz-container', children=[
+            # Sparse point cloud (Plotly)
+            dcc.Graph(
+                id='3d-plot',
+                figure=base_fig,
+                style={'height': '80vh'}
+            ),
+            # Gaussian Splat viewer (iframe - hidden by default)
+            html.Iframe(
+                id='splat-viewer',
+                src='/static/splat_viewer.html',
+                style={'width': '100%', 'height': '80vh', 'border': 'none', 'display': 'none'}
+            ),
+        ]),
 
         # Auto-refresh interval (every 1 second)
         dcc.Interval(
@@ -619,6 +676,35 @@ def create_dash_app(localization_state):
          Output('camera-interaction-time', 'data')],
         [Input('3d-plot', 'relayoutData')],
         [State('camera-store', 'data')],
+        prevent_initial_call=True
+    )
+
+    # Callback to toggle visualization visibility
+    @app.callback(
+        [Output('3d-plot', 'style'),
+         Output('splat-viewer', 'style')],
+        [Input('viz-mode-toggle', 'value')]
+    )
+    def toggle_visualization(viz_mode):
+        """Toggle between sparse point cloud and Gaussian splat visualization"""
+        if viz_mode == 'sparse':
+            return {'height': '80vh'}, {'display': 'none'}
+        else:
+            return {'display': 'none'}, {'width': '100%', 'height': '80vh', 'border': 'none'}
+
+    # Clientside callback to send camera mode to iframe
+    app.clientside_callback(
+        """
+        function(cameraMode) {
+            const iframe = document.getElementById('splat-viewer');
+            if (iframe && iframe.contentWindow) {
+                iframe.contentWindow.postMessage({type: 'setCameraMode', mode: cameraMode}, '*');
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output('splat-viewer', 'id'),  # Dummy output (no actual change)
+        [Input('camera-mode-toggle', 'value')],
         prevent_initial_call=True
     )
 
