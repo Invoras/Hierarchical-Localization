@@ -479,17 +479,20 @@ def create_dash_app(localization_state):
         """API endpoint for Gaussian Splat viewer to get drone position"""
         latest = localization_state.get_latest()
         if latest is None:
-            return jsonify({'error': 'No position data'}), 404
-
-        return jsonify({
-            'position': latest['position'].tolist(),
-            'rotation': latest['rotation'].flatten().tolist(),  # 3x3 matrix as flat array
-            'source': latest['source'],
-            'calibrated': latest['calibrated'],
-            'inliers': latest['inliers'],
-            'total_matches': latest['total_matches'],
-            'frame_num': latest['frame_num'],
-        })
+            response = jsonify({'error': 'No position data'})
+            response.status_code = 404
+        else:
+            response = jsonify({
+                'position': latest['position'].tolist(),
+                'rotation': latest['rotation'].flatten().tolist(),  # 3x3 matrix as flat array
+                'source': latest['source'],
+                'calibrated': latest['calibrated'],
+                'inliers': latest['inliers'],
+                'total_matches': latest['total_matches'],
+                'frame_num': latest['frame_num'],
+            })
+        
+        return response
 
     @app.server.route('/splat/<path:filename>')
     def serve_splat(filename):
