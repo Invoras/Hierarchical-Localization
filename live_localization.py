@@ -52,7 +52,7 @@ FRAME_INTERVAL = 0.1  # seconds
 WARMUP_DELAY = 10  # seconds - wait for SFU bandwidth estimation to ramp up to full quality
 
 # Localization configuration
-LOCALIZE_INTERVAL = 20.0  # seconds - localize drone position every 20 seconds (changed from 5.0 for telemetry-based dead reckoning)
+LOCALIZE_INTERVAL = 20.0  # seconds - default interval for auto mode (not used anymore, kept for reference)
 DASH_PORT = 8050
 DASH_HOST = "127.0.0.1"
 DASH_REFRESH_INTERVAL = 100  # milliseconds - browser refresh rate (increased to reduce load)
@@ -211,6 +211,11 @@ class HybridLocalizationState:
         # Status tracking
         self._pose_source = "waiting"  # "hloc", "telemetry", "waiting"
         self._error_message = None
+
+        # Localization control from UI
+        self._localization_mode = 'manual'  # 'manual' or 'auto'
+        self._localization_interval = 20.0  # seconds (for auto mode)
+        self._localization_request_pending = False  # flag for manual trigger
 
         # Reference data
         self.sparse_model = sparse_model
@@ -386,6 +391,35 @@ class HybridLocalizationState:
                 'source': self._pose_source,
                 'calibrated': self._calibrated,
             }
+
+    def set_localization_mode(self, mode, interval=20.0):
+        """Set localization mode from UI (thread-safe)"""
+        with self._lock:
+            self._localization_mode = mode
+            self._localization_interval = max(1.0, min(300.0, interval))  # Clamp to [1, 300]
+
+    def request_localization(self):
+        """Request immediate localization (manual mode, thread-safe)"""
+        with self._lock:
+            self._localization_request_pending = True
+
+    def should_localize(self, time_since_last):
+        """Check if localization should run now (thread-safe)"""
+        with self._lock:
+            if self._localization_mode == 'manual':
+                # Only localize if user requested it
+                if self._localization_request_pending:
+                    self._localization_request_pending = False
+                    return True
+                return False
+            else:  # auto mode
+                # Check interval
+                return time_since_last >= self._localization_interval
+
+    def get_localization_mode(self):
+        """Get current localization mode and interval (thread-safe)"""
+        with self._lock:
+            return self._localization_mode, self._localization_interval
 
 
 # Cache for sparse model bounds (computed once per model)
@@ -589,6 +623,41 @@ def create_dash_app(localization_state):
             ], style={'display': 'inline-block'}),
         ], style={'padding': '10px 20px', 'backgroundColor': '#f0f0f0', 'marginBottom': '10px'}),
 
+        # Localization Mode Controls
+        html.Div([
+            html.Label("HLOC Localization:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+            dcc.RadioItems(
+                id='localization-mode-toggle',
+                options=[
+                    {'label': ' Manual (Button)', 'value': 'manual'},
+                    {'label': ' Auto (Interval)', 'value': 'auto'}
+                ],
+                value='manual',  # Default
+                labelStyle={'display': 'inline-block', 'marginRight': '20px'},
+                style={'display': 'inline-block', 'marginRight': '10px'}
+            ),
+            # Manual mode button
+            html.Button(
+                'Localize Now',
+                id='localize-button',
+                n_clicks=0,
+                style={'padding': '8px 16px', 'marginRight': '10px', 'cursor': 'pointer'}
+            ),
+            # Auto mode interval input
+            html.Div([
+                html.Label("Interval (s):", style={'marginRight': '5px'}),
+                dcc.Input(
+                    id='localization-interval',
+                    type='number',
+                    value=20,
+                    min=1,
+                    max=300,
+                    step=1,
+                    style={'width': '60px'}
+                )
+            ], style={'display': 'none'}, id='interval-container'),  # Hidden by default (manual mode)
+        ], style={'padding': '10px 20px', 'backgroundColor': '#f0f0f0', 'marginBottom': '10px'}),
+
         # Store for camera state in manual mode
         dcc.Store(id='camera-store', data=None),
 
@@ -710,6 +779,37 @@ def create_dash_app(localization_state):
         [Input('camera-mode-toggle', 'value')],
         prevent_initial_call=True
     )
+
+    # Callback: Handle manual localization button click
+    @app.callback(
+        Output('localize-button', 'children'),
+        Input('localize-button', 'n_clicks'),
+        prevent_initial_call=True
+    )
+    def trigger_manual_localization(n_clicks):
+        """Request immediate localization when button is clicked"""
+        localization_state.request_localization()
+        return f'Localize Now (#{n_clicks})'
+
+    # Callback: Update mode and interval, control button/interval visibility
+    @app.callback(
+        [Output('localize-button', 'disabled'),
+         Output('interval-container', 'style')],
+        [Input('localization-mode-toggle', 'value'),
+         Input('localization-interval', 'value')]
+    )
+    def update_localization_settings(mode, interval):
+        """Update localization mode and control UI visibility"""
+        # Update state
+        localization_state.set_localization_mode(mode, interval if interval else 20.0)
+
+        # Disable button in auto mode, enable in manual mode
+        button_disabled = mode == 'auto'
+
+        # Show interval input in auto mode, hide in manual mode
+        interval_style = {'display': 'inline-block'} if mode == 'auto' else {'display': 'none'}
+
+        return button_disabled, interval_style
 
     @app.callback(
         [Output('3d-plot', 'figure'),
@@ -850,6 +950,14 @@ def create_dash_app(localization_state):
             calibrated = latest['calibrated']
             source_color = 'green' if source == 'hloc' else 'orange'
 
+            # Get localization mode info
+            loc_mode, loc_interval = localization_state.get_localization_mode()
+            loc_mode_str = f"{loc_mode.upper()}"
+            if loc_mode == 'auto':
+                loc_mode_detail = f"every {loc_interval:.0f}s"
+            else:
+                loc_mode_detail = "button"
+
             status_children = [
                 html.H3("Drone Position (meters)"),
                 html.P(f"X: {pos[0]:.3f} | Y: {pos[1]:.3f} | Z: {pos[2]:.3f}"),
@@ -864,6 +972,7 @@ def create_dash_app(localization_state):
                     ),
                     f" | HLOC Inliers: {latest['inliers']}/{latest['total_matches']} | ",
                     f"Calibrated: {'✓' if calibrated else '✗'} | ",
+                    f"Mode: {loc_mode_str} ({loc_mode_detail}) | ",
                     f"Time: {latest['timestamp'].strftime('%H:%M:%S')}"
                 ])
             ]
@@ -1115,7 +1224,7 @@ class FrameCapture:
                         logger.info(f"✅ SUCCESS: Receiving full 1080p resolution!")
 
                     logger.info(f"")
-                    logger.info(f"📍 Localizing drone position every {LOCALIZE_INTERVAL}s...")
+                    logger.info(f"📍 HLOC localization ready (manual mode by default, configurable via UI)")
                     warmup_complete = True
                     self.last_localize_time = asyncio.get_event_loop().time()
                 continue
@@ -1123,8 +1232,9 @@ class FrameCapture:
             # Localization after warm-up
             current_time = asyncio.get_event_loop().time()
 
-            # Localize every LOCALIZE_INTERVAL (5 seconds)
-            if current_time - self.last_localize_time >= LOCALIZE_INTERVAL:
+            # Check if we should localize (manual button or auto interval)
+            time_since_last = current_time - self.last_localize_time
+            if self.localization_state.should_localize(time_since_last):
                 if not self.localizing:  # Prevent overlap
                     self.localizing = True
                     asyncio.create_task(self.localize_frame(frame_event.frame))
@@ -1316,7 +1426,7 @@ class FrameCapture:
         try:
             room = await self.connect_to_room()
 
-            logger.info(f"📍 Localizing drone every {LOCALIZE_INTERVAL}s. Press Ctrl+C to stop.")
+            logger.info(f"📍 HLOC localization ready (manual mode by default). Press Ctrl+C to stop.")
 
             # Keep running until interrupted
             while self.running:
