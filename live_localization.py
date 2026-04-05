@@ -26,6 +26,7 @@ from datetime import datetime
 import time
 from pathlib import Path
 import requests
+import yaml
 import cv2
 import numpy as np
 from livekit import rtc
@@ -176,8 +177,8 @@ class HybridLocalizationState:
     Combines HLOC fixes (every 20s) with telemetry-based dead reckoning for
     continuous position updates.
 
-    Coordinate System: HLOC world frame with Y-up convention
-    - Y-axis: Vertical (altitude is position[1])
+    Coordinate System: HLOC world frame with Y-down convention (COLMAP default)
+    - Y-axis: Vertical, positive downward (altitude is position[1], increases going down)
     - Horizontal plane: X-Z
     - Yaw: Rotation around Y-axis
     """
@@ -287,7 +288,7 @@ class HybridLocalizationState:
             return
 
         # Extract HLOC heading (yaw) from rotation matrix
-        # Y-axis is up, yaw is rotation around Y in X-Z plane
+        # Y-axis is down, yaw is rotation around Y in X-Z plane
         # Camera forward is typically +Z axis, so extract yaw from Z-column
         R = self._dr_rotation_matrix
         hloc_yaw_rad = np.arctan2(R[0, 2], R[2, 2])  # Yaw of forward (+Z) direction
@@ -301,8 +302,8 @@ class HybridLocalizationState:
         # Normalize to [-180, 180]
         self._heading_offset_deg = ((heading_offset + 180.0) % 360.0) - 180.0
 
-        # Extract altitude offset (Y is altitude in HLOC)
-        # Negate position_z_m because NED Z-down (positive=down) vs HLOC Y-up (positive=up)
+        # Extract altitude offset (Y is altitude in HLOC, Y-down)
+        # DJI positionZ positive=up → negate to get HLOC Y-down (positive=down)
         telem_altitude = -self._latest_telemetry.get('position_z_m', 0.0)
         hloc_y = self._dr_position[1]  # Y is altitude
         self._altitude_offset_m = hloc_y - telem_altitude
@@ -334,27 +335,26 @@ class HybridLocalizationState:
         ])
 
         # Transform velocities: NED → HLOC world frame
-        # HLOC: Y-up, horizontal plane is X-Z
+        # HLOC: Y-down (COLMAP default), horizontal plane is X-Z
         # If forward is +Z in HLOC, then: North→Z, East→X (or vice versa)
         theta = np.radians(self._heading_offset_deg)
         v_hloc_z = v_ned[0] * np.cos(theta) - v_ned[1] * np.sin(theta)  # North→Z
         v_hloc_x = v_ned[0] * np.sin(theta) + v_ned[1] * np.cos(theta)  # East→X
-        v_hloc_y = -v_ned[2]  # Vertical (NED Z-down → HLOC Y-up)
 
         # Integrate horizontal position (X, Z from velocities)
         self._dr_position[0] += v_hloc_x * dt
         self._dr_position[2] += v_hloc_z * dt
 
         # Use altitude directly for Y (more accurate than integrating velocity_y)
-        # Negate position_z_m because NED Z-down (positive=down) vs HLOC Y-up (positive=up)
+        # DJI positionZ positive=up → negate for HLOC Y-down (positive=down)
         telem_altitude = -curr_telem.get('position_z_m', 0.0)
-        self._dr_position[1] = telem_altitude + self._altitude_offset_m  # Y is altitude
+        self._dr_position[1] = telem_altitude + self._altitude_offset_m  # Y is altitude (Y-down)
 
         # Update orientation (yaw only from telemetry heading)
         telem_heading = curr_telem.get('heading_deg', 0.0)
         hloc_yaw = np.radians(telem_heading + self._heading_offset_deg)
 
-        # Construct rotation matrix (Y-up convention, yaw rotation around Y)
+        # Construct rotation matrix (Y-down convention, yaw rotation around Y)
         cos_yaw = np.cos(hloc_yaw)
         sin_yaw = np.sin(hloc_yaw)
         self._dr_rotation_matrix = np.array([
@@ -390,6 +390,8 @@ class HybridLocalizationState:
                 'error': self._error_message,
                 'source': self._pose_source,
                 'calibrated': self._calibrated,
+                'heading_offset_deg': self._heading_offset_deg,
+                'altitude_offset_m': self._altitude_offset_m,
             }
 
     def set_localization_mode(self, mode, interval=20.0):
@@ -580,6 +582,66 @@ def create_dash_app(localization_state):
         name='Frustum Fill',
         showlegend=False
     ))
+
+    # Add static waypoint traces (loaded once, never updated)
+    waypoints_path = Path('waypoints.yaml')
+    if waypoints_path.exists():
+        with open(waypoints_path) as f:
+            wp_data = yaml.safe_load(f)
+        waypoints = wp_data.get('waypoints', [])
+        arrival_threshold = wp_data.get('arrival_threshold', 0.15)
+        if waypoints:
+            wx = [wp[0] for wp in waypoints]
+            wy = [wp[1] for wp in waypoints]
+            wz = [wp[2] for wp in waypoints]
+            # Path line connecting waypoints in order
+            base_fig.add_trace(go.Scatter3d(
+                x=wx, y=wy, z=wz,
+                mode='lines',
+                line=dict(width=2, color='cyan', dash='dash'),
+                name='Waypoint Path',
+                showlegend=True
+            ))
+            # Waypoint markers with index labels
+            base_fig.add_trace(go.Scatter3d(
+                x=wx, y=wy, z=wz,
+                mode='markers+text',
+                marker=dict(size=6, color='cyan', symbol='circle'),
+                text=[str(i) for i in range(len(waypoints))],
+                textposition='top center',
+                textfont=dict(color='cyan', size=11),
+                name='Waypoints',
+                showlegend=True
+            ))
+            # Arrival threshold spheres — 3 great circles per waypoint
+            t = np.linspace(0, 2 * np.pi, 40)
+            r = arrival_threshold
+            sx, sy, sz = [], [], []
+            for wp in waypoints:
+                cx, cy, cz = wp
+                # XZ circle (horizontal plane)
+                sx += (cx + r * np.cos(t)).tolist() + [None]
+                sy += ([cy] * 40) + [None]
+                sz += (cz + r * np.sin(t)).tolist() + [None]
+                # XY circle
+                sx += (cx + r * np.cos(t)).tolist() + [None]
+                sy += (cy + r * np.sin(t)).tolist() + [None]
+                sz += ([cz] * 40) + [None]
+                # YZ circle
+                sx += ([cx] * 40) + [None]
+                sy += (cy + r * np.sin(t)).tolist() + [None]
+                sz += (cz + r * np.cos(t)).tolist() + [None]
+            base_fig.add_trace(go.Scatter3d(
+                x=sx, y=sy, z=sz,
+                mode='lines',
+                line=dict(width=1, color='rgba(0,255,255,0.25)'),
+                name=f'Arrival Zone (±{r*100:.0f}cm)',
+                showlegend=True,
+                connectgaps=False
+            ))
+            logger.info(f"Added {len(waypoints)} waypoints (arrival threshold {r*100:.0f}cm) to visualization")
+    else:
+        logger.warning(f"waypoints.yaml not found at {waypoints_path.resolve()}, skipping waypoint overlay")
 
     # Track if first update (need full figure) or subsequent (use Patch)
     first_update = [True]  # Use list for mutability in closure

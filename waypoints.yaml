@@ -1,0 +1,13 @@
+# Waypoint mission — HLOC world frame coordinates [x, y, z]
+# Y-up convention: Y is altitude, X and Z are horizontal
+#
+# Replace these with actual coordinates from your HLOC map.
+# Run build_grid.py visualization to confirm coordinates are in free space.
+
+arrival_threshold: 0.15  # meters — must match ARRIVAL_THRESHOLD in WaypointMissionActivity.kt
+
+waypoints:
+  - [-0.14, 0.00, 0.05]
+  - [-0.89, 0.00, -2.36]
+  - [0.98, 0.00, -2.32]
+  - [-0.14, 0.00, 0.05]
